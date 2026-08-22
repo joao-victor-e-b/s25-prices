@@ -38,9 +38,13 @@ sources:
     seller: Outlet do Celular
     venue: own_site
     tier: 1
-    url: https://outletdocelular.com.br/celular-samsung/samsung-galaxy-s25-ultra-256gb
-    module: null             # Phase 3 — server-rendered, easy scrape
-    notes: 6-month warranty (best in class)
+    url: https://www.outletdocelular.com.br/celular-samsung/s25-ultra
+    category_url: https://www.outletdocelular.com.br/celular-samsung/s25-ultra
+    module: outletdocelular  # Tray; category -> per-product JSON-LD + price box
+    notes: 6-month warranty (best in class); each color+condition is a separate product
+    match:
+      storage_gb: 256
+      colors: [preto, jetblack]
 
   - id: amazon_seminovos
     seller: Amazon Seminovos

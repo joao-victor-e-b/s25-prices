@@ -39,9 +39,11 @@ _GRADE_TABLE: dict[str, list[tuple[str, int]]] = {
         ("aceitavel", 1),
     ],
     "outlet do celular": [
-        ("tier 1", 4),
-        ("tier 2", 3),
-        ("tier 3", 2),
+        # Their real labels carry a Grade A/B/C letter (tier 1/2/3 -> rank 4/3/2).
+        ("grade a", 4), ("como novo", 4),
+        ("grade b", 3), ("usado com cuidado", 3),
+        ("grade c", 2), ("marcas de uso", 2),
+        ("tier 1", 4), ("tier 2", 3), ("tier 3", 2),
     ],
     "mercado livre": [
         ("recondicionado pela marca", 4),
