@@ -26,7 +26,8 @@ def load_registry() -> list[dict]:
     return data.get("sources", [])
 
 
-def poll(daily: bool = False, enable_new_low: bool = False) -> dict:
+def poll(daily: bool = False, enable_new_low: bool = False,
+         dry_run: bool = False) -> dict:
     conn = store.connect(config.DB_PATH)
     store.init_db(conn)
 
@@ -62,7 +63,12 @@ def poll(daily: bool = False, enable_new_low: bool = False) -> dict:
             observations.append(o)
 
     alerts = triggers.evaluate(conn, observations, now, enable_new_low=enable_new_low)
-    if alerts:
+    if alerts and dry_run:
+        # Local testing: show what would fire, send nothing, don't touch dedup state.
+        print(f"[dry-run] {len(alerts)} alert(s) would send (no messages sent):")
+        for a in alerts:
+            print("  " + notify.format_alert(a).replace("\n", " | "))
+    elif alerts:
         report = notify.notify(alerts)
         for a in alerts:
             store.record_alert(conn, a.obs.listing_id, a.trigger, a.obs.pv, now)
@@ -90,6 +96,12 @@ def heartbeat() -> dict:
 
 
 def main(argv=None) -> int:
+    # Windows consoles default to cp1252 and choke on the alert emoji; force UTF-8.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     p = argparse.ArgumentParser(description="S25 Ultra refurb monitor")
     p.add_argument("--init-db", action="store_true")
     p.add_argument("--test-alert", action="store_true")
@@ -98,6 +110,8 @@ def main(argv=None) -> int:
     p.add_argument("--daily", action="store_true", help="include tier-3 sources")
     p.add_argument("--enable-new-low", action="store_true",
                    help="enable trigger 4 (needs ~30d history)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="evaluate + print alerts without sending or recording them")
     args = p.parse_args(argv)
 
     if args.init_db:
@@ -118,7 +132,7 @@ def main(argv=None) -> int:
         return 0
 
     # default action
-    poll(daily=args.daily, enable_new_low=args.enable_new_low)
+    poll(daily=args.daily, enable_new_low=args.enable_new_low, dry_run=args.dry_run)
     return 0
 
 

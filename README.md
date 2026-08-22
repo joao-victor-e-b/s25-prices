@@ -71,6 +71,7 @@ Subscribe to CallMeBot outage notifications so you learn about relay downtime.
 python -m src.run --init-db          # create schema
 python -m src.run --test-alert       # send one test message (both channels)
 python -m src.run --poll             # one poll cycle (tier 1-2)
+python -m src.run --poll --dry-run   # evaluate + print alerts, send nothing (safe local testing)
 python -m src.run --poll --daily     # include tier-3 sources
 python -m src.run --heartbeat        # daily summary
 python -m src.run --poll --enable-new-low   # after ~30 days of history
