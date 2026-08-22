@@ -56,13 +56,26 @@ class TrocafySource(Source):
         self.match = {**_DEFAULT_MATCH, **(cfg.get("match") or {})}
 
     def fetch(self) -> list[Observation]:
-        r = self.session.get(self.url, timeout=25)
-        r.raise_for_status()
-        return self.parse(r.content)
+        try:
+            r = self.session.get(self.url, timeout=25)
+            r.raise_for_status()
+            return self.parse(r.content)
+        except Exception:
+            # Trocafy's gocache CDN 403s datacenter IPs (e.g. GitHub Actions)
+            # while serving browsers fine. Fall back to a real headless browser,
+            # which passes the CDN fingerprinting. Local runs rarely hit this.
+            from ..render import render
+            html = render(self.url, wait_ms=3500,
+                          wait_selector="div.product-card")
+            return self.parse(html)
 
     # Separated from fetch() so it can be unit-tested against a saved fixture.
-    def parse(self, content: bytes) -> list[Observation]:
-        soup = BeautifulSoup(content, "lxml", from_encoding="iso-8859-1")
+    # Accepts bytes (requests) or str (Playwright-rendered).
+    def parse(self, content) -> list[Observation]:
+        if isinstance(content, bytes):
+            soup = BeautifulSoup(content, "lxml", from_encoding="iso-8859-1")
+        else:
+            soup = BeautifulSoup(content, "lxml")
         out: list[Observation] = []
         for card in soup.select("div.product-card"):
             obs = self._parse_card(card)
