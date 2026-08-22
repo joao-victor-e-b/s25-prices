@@ -17,8 +17,7 @@ INSTANT_BUY = 3500
 AGGRESSIVE = 3900
 PRIMARY = 4300
 
-DEDUP_HOURS = 24
-DEDUP_PV_DELTA = 100  # R$; a bigger move re-fires within the window
+DEDUP_PV_DELTA = 100  # R$; the same (listing, trigger) only re-fires on a drop this big
 
 PRIORITY = {
     "instant_buy": "🔴",
@@ -130,8 +129,11 @@ def evaluate(conn, observations: list[Observation], now: str,
 
 
 def _dedup(conn, candidates: list[Alert], now: str) -> list[Alert]:
+    """Suppress a repeat (listing_id, trigger) unless the PV has dropped by at
+    least DEDUP_PV_DELTA since it was last alerted. No time window — a rise or a
+    repeat at the same price never re-fires; only a genuine drop does. Crossing
+    into a stronger threshold still fires (it's a different trigger key)."""
     kept: list[Alert] = []
-    # Collapse duplicates within this same cycle first (keep first seen).
     seen_this_cycle: set[tuple] = set()
     for a in candidates:
         key = (a.obs.listing_id, a.trigger)
@@ -139,13 +141,13 @@ def _dedup(conn, candidates: list[Alert], now: str) -> list[Alert]:
             continue
         seen_this_cycle.add(key)
 
-        prior = store.last_alert(conn, a.obs.listing_id, a.trigger, DEDUP_HOURS, now)
+        prior = store.last_alert(conn, a.obs.listing_id, a.trigger,
+                                 within_hours=None, now=now)
         if prior is not None:
             prior_pv = prior["pv"]
-            if prior_pv is not None and a.obs.pv is not None:
-                if abs(a.obs.pv - prior_pv) <= DEDUP_PV_DELTA:
-                    continue  # too soon and PV barely moved -> suppress
-            else:
-                continue
+            if prior_pv is None or a.obs.pv is None:
+                continue  # can't confirm a drop -> suppress repeat
+            if a.obs.pv > prior_pv - DEDUP_PV_DELTA:
+                continue  # not a >=R$100 drop -> suppress repeat
         kept.append(a)
     return kept

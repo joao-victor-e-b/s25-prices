@@ -50,25 +50,40 @@ def test_rejects_out_of_stock(conn):
     assert triggers.evaluate(conn, [_obs(3400.0, in_stock=False)], now) == []
 
 
-def test_dedup_suppresses_repeat_within_24h(conn):
-    now1 = "2026-08-22T12:00:00+00:00"
-    a1 = triggers.evaluate(conn, [_obs(4200.0)], now1)
-    assert len(a1) == 1
-    for a in a1:
-        store.record_alert(conn, a.obs.listing_id, a.trigger, a.obs.pv, now1)
+def _fire_and_record(conn, obs, now):
+    alerts = triggers.evaluate(conn, [obs], now)
+    for a in alerts:
+        store.record_alert(conn, a.obs.listing_id, a.trigger, a.obs.pv, now)
+    return alerts
 
-    now2 = "2026-08-22T15:00:00+00:00"  # 3h later, PV barely moved
-    a2 = triggers.evaluate(conn, [_obs(4180.0)], now2)
+
+def test_dedup_suppresses_small_change(conn):
+    now1 = "2026-08-22T12:00:00+00:00"
+    assert len(_fire_and_record(conn, _obs(4200.0), now1)) == 1
+    # PV barely moved down (<R$100) -> suppressed
+    a2 = triggers.evaluate(conn, [_obs(4180.0)], "2026-08-22T15:00:00+00:00")
     assert a2 == []
 
 
-def test_dedup_refires_on_big_move(conn):
+def test_dedup_suppresses_price_increase(conn):
     now1 = "2026-08-22T12:00:00+00:00"
-    for a in triggers.evaluate(conn, [_obs(4200.0)], now1):
-        store.record_alert(conn, a.obs.listing_id, a.trigger, a.obs.pv, now1)
+    _fire_and_record(conn, _obs(4200.0), now1)
+    # price went UP -> never re-fire (drop-based dedup)
+    a2 = triggers.evaluate(conn, [_obs(4500.0)], "2026-08-23T12:00:00+00:00")
+    assert a2 == []
 
-    now2 = "2026-08-22T15:00:00+00:00"  # PV dropped > R$100
-    a2 = triggers.evaluate(conn, [_obs(4050.0)], now2)
+
+def test_dedup_no_refire_same_price_after_long_time(conn):
+    _fire_and_record(conn, _obs(4200.0), "2026-08-22T12:00:00+00:00")
+    # a week later, same price -> still suppressed (no time-based re-fire)
+    a2 = triggers.evaluate(conn, [_obs(4200.0)], "2026-08-29T12:00:00+00:00")
+    assert a2 == []
+
+
+def test_dedup_refires_on_price_drop(conn):
+    _fire_and_record(conn, _obs(4200.0), "2026-08-22T12:00:00+00:00")
+    # PV dropped >= R$100 -> re-fires
+    a2 = triggers.evaluate(conn, [_obs(4050.0)], "2026-08-22T15:00:00+00:00")
     assert {a.trigger for a in a2} == {"primary"}
 
 

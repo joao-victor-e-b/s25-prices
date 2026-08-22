@@ -106,14 +106,22 @@ def record_alert(conn: sqlite3.Connection, listing_id: str, trigger: str,
 # --- queries used by triggers -------------------------------------------------
 
 def last_alert(conn: sqlite3.Connection, listing_id: str, trigger: str,
-               within_hours: int, now: str) -> sqlite3.Row | None:
-    """Most recent alert for (listing_id, trigger) within a time window."""
-    cutoff = (datetime.fromisoformat(now) - timedelta(hours=within_hours)).isoformat()
-    cur = conn.execute(
-        "SELECT ts, pv FROM alerts_sent WHERE listing_id=? AND trigger=? "
-        "AND ts >= ? ORDER BY ts DESC LIMIT 1",
-        (listing_id, trigger, cutoff),
-    )
+               within_hours: int | None, now: str) -> sqlite3.Row | None:
+    """Most recent alert for (listing_id, trigger). With within_hours=None,
+    look at the whole history (dedup is now drop-based, not time-based)."""
+    if within_hours is None:
+        cur = conn.execute(
+            "SELECT ts, pv FROM alerts_sent WHERE listing_id=? AND trigger=? "
+            "ORDER BY ts DESC LIMIT 1",
+            (listing_id, trigger),
+        )
+    else:
+        cutoff = (datetime.fromisoformat(now) - timedelta(hours=within_hours)).isoformat()
+        cur = conn.execute(
+            "SELECT ts, pv FROM alerts_sent WHERE listing_id=? AND trigger=? "
+            "AND ts >= ? ORDER BY ts DESC LIMIT 1",
+            (listing_id, trigger, cutoff),
+        )
     return cur.fetchone()
 
 
