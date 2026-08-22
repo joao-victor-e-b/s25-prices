@@ -51,8 +51,12 @@ sources:
     venue: amazon
     tier: 1
     url: https://www.amazon.com.br/dp/B0FTMQQ7L2
-    module: null             # robots-blocked; Keepa or manual check
-    notes: needs care / data provider
+    asin: B0FTMQQ7L2
+    module: amazon           # direct fetch w/ browser headers; raises on captcha
+    notes: robots-hostile; may captcha from CI datacenter IP (surfaced as failure)
+    match:
+      storage_gb: 256
+      colors: [preto, jetblack]
 
   - id: mercadolivre_recond
     seller: Mercado Livre

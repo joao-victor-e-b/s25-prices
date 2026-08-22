@@ -15,6 +15,18 @@ _GENERIC = [
     ("vitrine", 5),
 ]
 
+# Fallback for the common Portuguese condition words, used only when no
+# seller-specific table matched (e.g. Amazon marketplace offers whose shipper
+# isn't one of the known sellers). Specific phrases first ("muito bom" > "bom").
+_GENERIC_GRADES = [
+    ("como novo", 4),
+    ("muito bom", 3),
+    ("excelente", 4),
+    ("premium", 4),
+    ("aceitavel", 1),
+    ("bom", 2),
+]
+
 # Per-seller taxonomy. Order matters: more specific substrings first so
 # "muito bom" is matched before "bom" and "recondicionado pela marca" before
 # "recondicionado".
@@ -89,6 +101,10 @@ def grade_rank(seller: str | None, grade_raw: str | None) -> int | None:
         for kw, rank in _GRADE_TABLE[key]:
             if kw in g:
                 return rank
+    # fall back to the universal condition vocabulary
+    for kw, rank in _GENERIC_GRADES:
+        if kw in g:
+            return rank
     return None
 
 
