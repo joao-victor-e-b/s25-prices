@@ -16,9 +16,12 @@ sources:
     seller: Trocafy
     venue: own_site
     tier: 1
-    url: https://trocafy.com.br/smartphone/samsung/galaxy-s25-ultra/
-    module: trocafy          # Phase 2 — price leader, cleanest target
-    notes: category server-rendered; per-product price loads client-side
+    url: https://www.trocafy.com.br/smartphone/samsung/galaxy-s25-ultra/
+    module: trocafy          # price leader, cleanest target
+    notes: iSET platform; category server-rendered with prices in HTML
+    match:                   # target filter (spec §1); widen colors to see more
+      storage_gb: 256
+      colors: [preto, jetblack]
 
   - id: trocafone_site
     seller: Trocafone
