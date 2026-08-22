@@ -17,6 +17,7 @@ import re
 from bs4 import BeautifulSoup
 
 from ..models import Observation
+from ..normalize import coupon_from_text
 from .base import Source
 
 _HOST = "https://www.amazon.com.br"
@@ -173,6 +174,12 @@ class AmazonSeminovosSource(Source):
             installments_n, installment_value = best
             interest_flag = False
 
+        # clip-coupon widget in the buybox (folds into PV via the coupon field)
+        coupon = 0.0
+        cel = soup.select_one("#couponsInBuybox_feature_div")
+        if cel:
+            coupon = coupon_from_text(cel.get_text(" ", strip=True), list_price)
+
         seller = self._seller(soup)
         color = _find_color(title)
         sm = _STORAGE_RE.search(title)
@@ -191,6 +198,7 @@ class AmazonSeminovosSource(Source):
             battery_band=None,
             list_price=list_price,
             pix_discount=0.0,
+            coupon=coupon,
             installments_n=installments_n,
             installment_value=installment_value,
             interest_flag=interest_flag,

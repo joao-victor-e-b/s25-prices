@@ -1,6 +1,7 @@
 """Grade normalization (spec §2) and present-value computation (spec §3)."""
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from .models import Observation
@@ -155,6 +156,56 @@ def finalize(o: Observation, cdi_monthly: float) -> Observation:
 # Left empty by default: build order §10 adds cashback last. Populate like:
 #   CASHBACK_RATES = {"own_site": [("Meliuz", 0.05), ("Nubank", 0.03)]}
 CASHBACK_RATES: dict[str, list[tuple[str, float]]] = {}
+
+
+# --- Coupon extraction (spec §3 `coupon` field) -------------------------------
+# Gated on an explicit coupon word so a PIX "% de desconto" is never mistaken for
+# a coupon (which would double-count against pix_discount). Absolute R$ patterns
+# and coupon-scoped % patterns only.
+_COUPON_WORDS = ("cupom", "cupons", "economize")
+_COUPON_ABS = [
+    r"economize\s+r\$\s*([\d.,]+)",
+    r"cupom[^r%]{0,25}r\$\s*([\d.,]+)",
+    r"r\$\s*([\d.,]+)\s+de\s+desconto",
+]
+_COUPON_PCT = [
+    r"cupom[^%]{0,25}?(\d{1,2})\s*%",   # non-greedy so "10%" isn't read as "0%"
+    r"(\d{1,2})\s*%[^%]{0,25}cupom",
+]
+
+
+def _brl_num(s: str) -> float | None:
+    s = s.strip()
+    s = s.replace(".", "").replace(",", ".") if "," in s else s.replace(".", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def coupon_from_text(text: str | None, list_price: float | None = None) -> float:
+    """Parse a coupon value (R$ off) from a scoped snippet, or 0.0.
+
+    Requires an explicit coupon word. Absolute amounts win; percent is applied to
+    list_price. Returns 0.0 for PIX/other non-coupon discounts.
+    """
+    if not text:
+        return 0.0
+    t = _norm(text)
+    if not any(w in t for w in _COUPON_WORDS):
+        return 0.0
+    for pat in _COUPON_ABS:
+        m = re.search(pat, t)
+        if m:
+            val = _brl_num(m.group(1))
+            if val:
+                return round(val, 2)
+    if list_price:
+        for pat in _COUPON_PCT:
+            m = re.search(pat, t)
+            if m:
+                return round(list_price * int(m.group(1)) / 100, 2)
+    return 0.0
 
 
 def apply_cashback(o: Observation, rates: dict | None = None) -> Observation:

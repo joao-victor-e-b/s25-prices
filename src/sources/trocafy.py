@@ -21,6 +21,7 @@ import re
 from bs4 import BeautifulSoup
 
 from ..models import Observation
+from ..normalize import coupon_from_text
 from .base import Source
 
 _PRICE_RE = re.compile(r"R\$\s*([\d.]+,\d{2})")
@@ -148,6 +149,8 @@ class TrocafySource(Source):
         if pix_price is not None and list_price is not None and list_price > pix_price:
             pix_discount = round(list_price - pix_price, 2)
 
+        coupon = coupon_from_text(card.get_text(" ", strip=True), list_price)
+
         return Observation(
             source_id=self.source_id,
             seller=self.seller,
@@ -161,6 +164,7 @@ class TrocafySource(Source):
             battery_band=None,
             list_price=list_price,
             pix_discount=pix_discount,
+            coupon=coupon,
             installments_n=installments_n,
             installment_value=installment_value,
             interest_flag=interest_flag,

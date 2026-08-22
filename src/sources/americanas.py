@@ -19,6 +19,7 @@ import re
 from bs4 import BeautifulSoup
 
 from ..models import Observation
+from ..normalize import coupon_from_text
 from ..render import render
 from .base import Source
 
@@ -142,6 +143,7 @@ class AmericanasSource(Source):
             battery_band=None,
             list_price=list_price,
             pix_discount=pix_discount,
+            coupon=coupon_from_text(text, list_price),
             installments_n=installments_n,
             installment_value=installment_value,
             interest_flag=interest_flag,

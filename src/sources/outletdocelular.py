@@ -22,6 +22,7 @@ import re
 from bs4 import BeautifulSoup
 
 from ..models import Observation
+from ..normalize import coupon_from_text
 from .base import Source
 
 _CATEGORY = "https://www.outletdocelular.com.br/celular-samsung/s25-ultra"
@@ -167,6 +168,7 @@ class OutletDoCelularSource(Source):
             battery_band=None,
             list_price=list_price,
             pix_discount=pix_discount,
+            coupon=coupon_from_text(soup.get_text(" ", strip=True), list_price),
             installments_n=None,
             installment_value=None,
             interest_flag=None,
