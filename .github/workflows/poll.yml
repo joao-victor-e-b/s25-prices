@@ -34,6 +34,15 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
       - name: Hourly poll
         if: github.event.schedule == '17 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'poll')
         run: python -m src.run --poll

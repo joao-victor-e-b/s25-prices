@@ -95,12 +95,17 @@ sources:
     url: https://www.mercadolivre.com.br/
     module: null
 
-  - id: americanas_trocafone
-    seller: Trocafone
+  - id: americanas
+    seller: Americanas
     venue: americanas
     tier: 2
-    url: https://www.americanas.com.br/
-    module: null
+    url: https://www.americanas.com.br/busca/galaxy-s25-ultra-256gb
+    search_url: https://www.americanas.com.br/busca/galaxy-s25-ultra-256gb
+    module: americanas        # Playwright-rendered; captures "Usado:" refurb listings
+    notes: renders client-side; seller (e.g. Trocafone) parsed per listing
+    match:
+      storage_gb: 256
+      colors: [preto, jetblack]
 
   # --- Tier 3: low hit rate, poll daily ---
   - id: samsung_br_outlet
