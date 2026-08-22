@@ -27,7 +27,8 @@ def load_registry() -> list[dict]:
 
 
 def poll(daily: bool = False, enable_new_low: bool = False,
-         dry_run: bool = False, scan_promos: bool = True) -> dict:
+         dry_run: bool = False, scan_promos: bool = True,
+         max_tier: int = 2) -> dict:
     conn = store.connect(config.DB_PATH)
     store.init_db(conn)
 
@@ -39,9 +40,12 @@ def poll(daily: bool = False, enable_new_low: bool = False,
     failures = 0
     observations = []
 
+    # daily runs sweep all tiers; otherwise cap at max_tier (frequent 15-min
+    # runs use tier 1 only to stay fast/cheap; hourly runs do tier 1+2).
+    allowed_max = 3 if daily else max_tier
     for cfg in sources:
         tier = cfg.get("tier", 1)
-        if tier >= 3 and not daily:
+        if tier > allowed_max:
             continue
         src = load_source(cfg)
         if src is None:
@@ -165,6 +169,8 @@ def main(argv=None) -> int:
                    help="evaluate + print alerts without sending or recording them")
     p.add_argument("--no-promos", action="store_true",
                    help="skip the deal-aggregator promotions scan")
+    p.add_argument("--tier1", action="store_true",
+                   help="poll only tier-1 sources (fast 15-min cadence)")
     args = p.parse_args(argv)
 
     if args.init_db:
@@ -186,7 +192,8 @@ def main(argv=None) -> int:
 
     # default action
     poll(daily=args.daily, enable_new_low=args.enable_new_low,
-         dry_run=args.dry_run, scan_promos=not args.no_promos)
+         dry_run=args.dry_run, scan_promos=not args.no_promos,
+         max_tier=1 if args.tier1 else 2)
     return 0
 
 
