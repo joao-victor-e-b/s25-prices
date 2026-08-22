@@ -21,6 +21,16 @@ def brl(value: float | None) -> str:
     return s.replace(",", "X").replace(".", ",").replace("X", ".")  # 4.399,90
 
 
+def money(value: float | None) -> str:
+    """'R$ 4.399,90' — note the space after R$.
+
+    CallMeBot's whatsapp.php runs the text through a PHP preg_replace, where a
+    '$' immediately followed by a digit is a capture-group backreference and
+    gets deleted. Keeping a space after 'R$' avoids that (and matches BR style).
+    """
+    return f"R$ {brl(value)}"
+
+
 def format_alert(a: Alert) -> str:
     """Render one alert in the spec §7 layout."""
     o = a.obs
@@ -28,7 +38,7 @@ def format_alert(a: Alert) -> str:
     storage = f"{o.storage_gb}GB" if o.storage_gb else ""
     header = f"{a.priority} S25 Ultra {storage} {color}".strip()
 
-    price_bits = [f"PV R${brl(o.pv)}"]
+    price_bits = [f"PV {money(o.pv)}"]
     detail = []
     if o.list_price:
         detail.append(f"list {brl(o.list_price)}")
@@ -46,7 +56,7 @@ def format_alert(a: Alert) -> str:
     line4 = ""
     if o.installments_n and o.installment_value:
         juros = "s/juros" if o.interest_flag is False else "c/juros"
-        line4 = f"{o.installments_n}x {juros} de R${brl(o.installment_value)}"
+        line4 = f"{o.installments_n}x {juros} de {money(o.installment_value)}"
 
     note = f"[{a.note}]" if a.note else ""
     lines = [header, price_line, line3, line4, note, o.url]
@@ -119,7 +129,7 @@ def notify(alerts: list[Alert]) -> dict:
 def send_heartbeat(best_pv: float | None, sources_polled: int,
                    scrape_failures: int) -> dict:
     """Daily 09:00 one-liner making silent scraper decay visible (spec §7)."""
-    best = f"R${brl(best_pv)}" if best_pv is not None else "sem oferta elegível"
+    best = money(best_pv) if best_pv is not None else "sem oferta elegível"
     msg = (f"📊 S25 heartbeat — melhor PV: {best} · "
            f"{sources_polled} fontes · {scrape_failures} falhas")
     return {
