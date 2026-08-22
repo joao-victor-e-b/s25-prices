@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
   pv          NUMERIC,
   PRIMARY KEY (listing_id, trigger, ts)
 );
+
+CREATE TABLE IF NOT EXISTS promotions (
+  ts      TIMESTAMP NOT NULL,
+  source  TEXT,
+  title   TEXT,
+  url     TEXT NOT NULL,
+  price   NUMERIC,
+  PRIMARY KEY (url, ts)
+);
 """
 
 
@@ -74,6 +83,14 @@ def insert_observation(conn: sqlite3.Connection, obs: Observation) -> None:
     conn.execute(
         f"INSERT OR REPLACE INTO observations ({cols}) VALUES ({placeholders})",
         row,
+    )
+
+
+def insert_promo(conn: sqlite3.Connection, promo, ts: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO promotions (ts, source, title, url, price) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (ts, promo.source, promo.title, promo.url, promo.price),
     )
 
 

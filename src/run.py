@@ -14,7 +14,7 @@ import sys
 
 import yaml
 
-from . import config, notify, store, triggers
+from . import config, notify, promos as promos_mod, store, triggers
 from .cdi import get_cdi_monthly
 from .normalize import apply_cashback, finalize, pv
 from .sources import load_source
@@ -27,7 +27,7 @@ def load_registry() -> list[dict]:
 
 
 def poll(daily: bool = False, enable_new_low: bool = False,
-         dry_run: bool = False) -> dict:
+         dry_run: bool = False, scan_promos: bool = True) -> dict:
     conn = store.connect(config.DB_PATH)
     store.init_db(conn)
 
@@ -77,12 +77,41 @@ def poll(daily: bool = False, enable_new_low: bool = False,
     else:
         print("[alerts] none")
 
+    # --- Phase 4b: promotions scan (best-effort; never breaks the poll) ---
+    if scan_promos:
+        _scan_promotions(conn, now, dry_run)
+
     conn.commit()
     conn.close()
     result = {"polled": polled, "failures": failures,
               "observations": len(observations), "alerts": len(alerts)}
     print(f"[poll] {result}")
     return result
+
+
+def _scan_promotions(conn, now: str, dry_run: bool) -> None:
+    try:
+        promos = promos_mod.scan()
+    except Exception as e:  # DDG hiccup must not sink the poll
+        print(f"[promo-fail] {e}", file=sys.stderr)
+        return
+    fresh = []
+    for pr in promos:
+        pr.ts = now
+        store.insert_promo(conn, pr, now)
+        if store.last_alert(conn, pr.url, "promo", 24, now) is None:
+            fresh.append(pr)
+    if fresh and dry_run:
+        print(f"[dry-run] {len(fresh)} promo(s) would send:")
+        for pr in fresh:
+            print("  " + notify.format_promo(pr).replace("\n", " | "))
+    elif fresh:
+        rep = notify.notify_promos(fresh)
+        for pr in fresh:
+            store.record_alert(conn, pr.url, "promo", pr.price, now)
+        print(f"[promos] sent={rep['sent']} wa_ok={rep['wa_ok']} ntfy_ok={rep['ntfy_ok']}")
+    else:
+        print(f"[promos] scanned={len(promos)} none new")
 
 
 def heartbeat() -> dict:
@@ -112,6 +141,8 @@ def main(argv=None) -> int:
                    help="enable trigger 4 (needs ~30d history)")
     p.add_argument("--dry-run", action="store_true",
                    help="evaluate + print alerts without sending or recording them")
+    p.add_argument("--no-promos", action="store_true",
+                   help="skip the deal-aggregator promotions scan")
     args = p.parse_args(argv)
 
     if args.init_db:
@@ -132,7 +163,8 @@ def main(argv=None) -> int:
         return 0
 
     # default action
-    poll(daily=args.daily, enable_new_low=args.enable_new_low, dry_run=args.dry_run)
+    poll(daily=args.daily, enable_new_low=args.enable_new_low,
+         dry_run=args.dry_run, scan_promos=not args.no_promos)
     return 0
 
 

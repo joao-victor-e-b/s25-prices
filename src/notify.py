@@ -139,6 +139,36 @@ def send_heartbeat(best_pv: float | None, sources_polled: int,
     }
 
 
+def format_promo(promo) -> str:
+    """One-line promo post (Phase 4b) in the §7 style."""
+    price = f" — {money(promo.price)}" if promo.price is not None else ""
+    return f"🔔 Promo S25 Ultra{price}\n{promo.title}\n{promo.source}\n{promo.url}"
+
+
+def notify_promos(promos: list) -> dict:
+    """Send promo posts, batched, WhatsApp + ntfy (best-effort)."""
+    if not promos:
+        return {"sent": 0, "wa_ok": True, "ntfy_ok": True}
+    wa_ok = ntfy_ok = True
+    current = ""
+    batches = []
+    for pr in promos:
+        block = format_promo(pr)
+        if current and len(current) + len(block) + 2 > _MAX_CHARS:
+            batches.append(current)
+            current = block
+        else:
+            current = f"{current}\n\n{block}" if current else block
+    if current:
+        batches.append(current)
+    for msg in batches:
+        if not send_whatsapp(msg):
+            wa_ok = False
+        if not send_ntfy(msg, title="S25 promo"):
+            ntfy_ok = False
+    return {"sent": len(promos), "wa_ok": wa_ok, "ntfy_ok": ntfy_ok}
+
+
 def send_test() -> dict:
     """Fire a single test message through both channels (build order §10.1)."""
     msg = "✅ S25 monitor: canal de alerta funcionando (teste)."

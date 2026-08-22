@@ -61,3 +61,17 @@ class Observation:
         known = {f.name for f in fields(cls)}
         data = {k: row[k] for k in row.keys() if k in known}
         return cls(**data)
+
+
+@dataclass
+class Promo:
+    """A promotion post found on a deal-aggregator (Phase 4b).
+
+    A looser signal than an Observation: free-text deal posts, often for new
+    (not refurb) units, with no normalized grade. Used for the 'promo' alert.
+    """
+    source: str          # aggregator domain
+    title: str
+    url: str
+    price: float | None = None
+    ts: str | None = None
