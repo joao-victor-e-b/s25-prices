@@ -53,6 +53,10 @@ jobs:
           python -m src.run --poll --daily
           python -m src.run --heartbeat
 
+      - name: Dry poll (no messages)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'dry'
+        run: python -m src.run --poll --dry-run
+
       - name: Test alert
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
         run: python -m src.run --test-alert
