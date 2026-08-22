@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from src.promos import parse_ddg
+from src.promos import _parse_price, parse_ddg
+
+
+def test_price_parsing_with_and_without_cents():
+    assert _parse_price("Por R$ 4.033,71: foo") == 4033.71
+    assert _parse_price("Por R$ 4.320: bar") == 4320.0   # thousands, no cents
+    assert _parse_price("sem preço aqui") is None
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ddg_promos.html"
 

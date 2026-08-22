@@ -8,19 +8,26 @@ pushes a WhatsApp alert when a buy-worthy condition fires.
 Built to the consolidated spec (`s25monitorbuildspecv2.md`). Runs on an hourly
 GitHub Actions cron. Alerts via CallMeBot (WhatsApp) with an ntfy.sh fallback.
 
-## Status — Phase 1 complete
+## Status
 
-- ✅ Storage + schema (`src/store.py`, spec §5)
-- ✅ Grade normalization + PV + cashback layer (`src/normalize.py`, spec §2–3)
-- ✅ CDI fetch with fallback (`src/cdi.py`)
-- ✅ All 8 alert triggers + 24h dedup (`src/triggers.py`, spec §6)
-- ✅ CallMeBot + ntfy notifier, message formatting, heartbeat (`src/notify.py`, spec §7)
-- ✅ Orchestrator + config registry (`src/run.py`, `src/registry.yaml`)
-- ✅ GitHub Actions workflow (`.github/workflows/poll.yml`, spec §8)
-- ⏳ Scrapers — Phase 2 (`src/sources/`); Trocafy first (price leader)
+Core (spec §2–8): storage/schema, grade normalization + PV + cashback layer,
+CDI fetch, all 8 triggers + 24h dedup, CallMeBot + ntfy + heartbeat, orchestrator,
+GitHub Actions hourly cron. `new_low` stays off until ~30 days of history
+(`--enable-new-low`, build order §10.6).
 
-`trigger 4 (new_low)` is implemented but stays off until ~30 days of history
-exists (run with `--enable-new-low`), per build order §10.6.
+**Sources (live):**
+
+| Source | Method |
+|---|---|
+| Trocafy | HTTP + Playwright fallback (CDN 403s datacenter IPs) |
+| Trocafone | VTEX catalog API |
+| Outlet do Celular | Tray category → per-product JSON-LD |
+| Amazon Seminovos | direct HTTP, best-effort (raises on captcha) |
+| Americanas | Playwright (refurb "Usado:" listings) |
+| Promotions | DuckDuckGo scan of deal-aggregators → 🔔 promo alerts (Phase 4b) |
+
+**Blocked/parked:** Magalu & Mercado Livre (fingerprint headless Chromium);
+ML OAuth parked pending their auth-loop fix.
 
 ## Layout
 

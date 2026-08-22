@@ -101,6 +101,12 @@ def _scan_promotions(conn, now: str, dry_run: bool) -> None:
         store.insert_promo(conn, pr, now)
         if store.last_alert(conn, pr.url, "promo", 24, now) is None:
             fresh.append(pr)
+    # cheapest-first, cap per run so a big first batch doesn't spam
+    fresh.sort(key=lambda p: (p.price is None, p.price or 0))
+    PROMO_CAP = 10
+    if len(fresh) > PROMO_CAP:
+        print(f"[promos] capping {len(fresh)} -> {PROMO_CAP} this run")
+        fresh = fresh[:PROMO_CAP]
     if fresh and dry_run:
         print(f"[dry-run] {len(fresh)} promo(s) would send:")
         for pr in fresh:

@@ -34,9 +34,26 @@ DOMAINS = [
     "tukofertas.com.br",
 ]
 TERM = "galaxy s25 ultra 256gb"
-_PRICE_RE = re.compile(r"R\$\s*([\d.]+,\d{2})")
-# Non-deal paths to skip (reviews/comparisons, not offers).
-_SKIP_PATHS = ("/blog/", "/review/", "/analise", "/noticia")
+# Matches "R$ 4.320,00" and "R$ 4.320" (thousands, no cents).
+_PRICE_RE = re.compile(r"R\$\s*(\d[\d.]*(?:,\d{2})?)")
+# Non-deal paths to skip (reviews/specs/comparisons, not offers).
+_SKIP_PATHS = ("/blog/", "/review/", "/analise", "/noticia",
+               "/fichas-tecnicas/", "/provas/", "/opiniao", "/comparar")
+
+
+def _parse_price(text: str) -> float | None:
+    m = _PRICE_RE.search(text or "")
+    if not m:
+        return None
+    s = m.group(1)
+    if "," in s:                      # 4.033,71 -> 4033.71
+        s = s.replace(".", "").replace(",", ".")
+    else:                             # 4.320 -> 4320
+        s = s.replace(".", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 def _real_url(href: str) -> str | None:
@@ -68,8 +85,7 @@ def parse_ddg(html: str, domain: str | None = None) -> list[Promo]:
         if "s25" not in blob:
             continue
         host = urllib.parse.urlparse(url).netloc.replace("www.", "")
-        pm = _PRICE_RE.search(title)
-        price = float(pm.group(1).replace(".", "").replace(",", ".")) if pm else None
+        price = _parse_price(title)
         seen.add(url)
         out.append(Promo(source=host or (domain or "web"), title=title,
                          url=url, price=price))
