@@ -1,0 +1,97 @@
+# Source registry (spec §4). Adding a seller is a config change, not a code
+# change. `module` points at src/sources/<module>.py exposing a `SOURCE` class.
+# Sources without an implemented module are skipped (Phase 2 fills these in).
+#
+# fields:
+#   id      unique source_id (matches schema)
+#   seller  who actually ships
+#   venue   own_site | magalu | amazon | ml | americanas
+#   tier    1 (hourly), 2 (hourly, arbitrage), 3 (daily)
+#   url     listing/category URL
+#   module  scraper module name (null until implemented)
+
+sources:
+  # --- Tier 1: confirmed to stock SM-S938B 256GB ---
+  - id: trocafy_site
+    seller: Trocafy
+    venue: own_site
+    tier: 1
+    url: https://trocafy.com.br/smartphone/samsung/galaxy-s25-ultra/
+    module: trocafy          # Phase 2 — price leader, cleanest target
+    notes: category server-rendered; per-product price loads client-side
+
+  - id: trocafone_site
+    seller: Trocafone
+    venue: own_site
+    tier: 1
+    url: https://trocafone.com.br/samsung-galaxy-s25-ultra-256gb/p
+    module: null             # Phase 3 — hit the XHR/JSON endpoint, don't render
+    notes: React; price + condition arrive via XHR/JSON
+
+  - id: outletdocelular
+    seller: Outlet do Celular
+    venue: own_site
+    tier: 1
+    url: https://outletdocelular.com.br/celular-samsung/samsung-galaxy-s25-ultra-256gb
+    module: null             # Phase 3 — server-rendered, easy scrape
+    notes: 6-month warranty (best in class)
+
+  - id: amazon_seminovos
+    seller: Amazon Seminovos
+    venue: amazon
+    tier: 1
+    url: https://www.amazon.com.br/dp/B0FTMQQ7L2
+    module: null             # robots-blocked; Keepa or manual check
+    notes: needs care / data provider
+
+  - id: mercadolivre_recond
+    seller: Mercado Livre
+    venue: ml
+    tier: 1
+    url: https://lista.mercadolivre.com.br/samsung-galaxy-s25-ultra-256gb_recondicionado
+    module: null
+    notes: prefer "recondicionado pela marca" (1yr warranty)
+
+  # --- Tier 2: same sellers, different coupon stacks (arbitrage) ---
+  - id: magalu_trocafone
+    seller: Trocafone
+    venue: magalu
+    tier: 2
+    url: https://www.magazineluiza.com.br/
+    module: null
+
+  - id: magalu_trocafy
+    seller: Trocafy
+    venue: magalu
+    tier: 2
+    url: https://www.magazineluiza.com.br/
+    module: null
+
+  - id: ml_trocafone
+    seller: Trocafone
+    venue: ml
+    tier: 2
+    url: https://www.mercadolivre.com.br/
+    module: null
+
+  - id: ml_trocafy
+    seller: Trocafy
+    venue: ml
+    tier: 2
+    url: https://www.mercadolivre.com.br/
+    module: null
+
+  - id: americanas_trocafone
+    seller: Trocafone
+    venue: americanas
+    tier: 2
+    url: https://www.americanas.com.br/
+    module: null
+
+  # --- Tier 3: low hit rate, poll daily ---
+  - id: samsung_br_outlet
+    seller: Samsung BR
+    venue: own_site
+    tier: 3
+    url: https://www.samsung.com/br/shop/
+    module: null
