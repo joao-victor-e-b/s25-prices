@@ -113,12 +113,16 @@ def last_observation(conn: sqlite3.Connection, source_id: str,
 
 def pv_series(conn: sqlite3.Connection, seller: str, grade_rank: int,
               days: int, now: str) -> list[float]:
-    """Trailing PV values for a seller+grade over the last N days."""
+    """Trailing PV values for a seller+grade over the last N days.
+
+    Excludes the current poll (ts < now) so percentile/median comparisons run
+    against genuine prior history, not rows just inserted this cycle.
+    """
     cutoff = (datetime.fromisoformat(now) - timedelta(days=days)).isoformat()
     cur = conn.execute(
         "SELECT pv FROM observations WHERE seller=? AND grade_rank=? "
-        "AND ts >= ? AND pv IS NOT NULL",
-        (seller, grade_rank, cutoff),
+        "AND ts >= ? AND ts < ? AND pv IS NOT NULL",
+        (seller, grade_rank, cutoff, now),
     )
     return [row["pv"] for row in cur.fetchall()]
 

@@ -89,6 +89,24 @@ def test_venue_spread(conn):
     assert "venue_spread" in {al.trigger for al in alerts}
 
 
+def test_grade_upgrade_needs_prior_history(conn):
+    # rank-4 in stock but no prior rank-3 history -> no grade_upgrade (cold start)
+    now = "2026-08-22T12:00:00+00:00"
+    alerts = triggers.evaluate(conn, [_obs(4477.0, grade_rank=4)], now)
+    assert "grade_upgrade" not in {a.trigger for a in alerts}
+
+
+def test_grade_upgrade_fires_with_prior_history(conn):
+    # prior rank-3 (Muito Bom) history at 4699
+    prior = _obs(4699.0, listing_id="R3", grade_rank=3,
+                 ts="2026-08-21T12:00:00+00:00")
+    store.insert_observation(conn, prior)
+    now = "2026-08-22T12:00:00+00:00"
+    # rank-4 in stock at 4477 <= median rank-3 (4699) -> grade_upgrade
+    alerts = triggers.evaluate(conn, [_obs(4477.0, listing_id="R4", grade_rank=4)], now)
+    assert "grade_upgrade" in {a.trigger for a in alerts}
+
+
 def test_trocafy_review(conn):
     now = "2026-08-22T12:00:00+00:00"
     o = _obs(3400.0, grade_rank=2, manual_review=True)

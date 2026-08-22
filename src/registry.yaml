@@ -27,9 +27,12 @@ sources:
     seller: Trocafone
     venue: own_site
     tier: 1
-    url: https://trocafone.com.br/samsung-galaxy-s25-ultra-256gb/p
-    module: null             # Phase 3 — hit the XHR/JSON endpoint, don't render
-    notes: React; price + condition arrive via XHR/JSON
+    url: https://www.trocafone.com.br/samsung-galaxy-s25-ultra-256gb/p
+    module: trocafone        # VTEX public catalog API — cleanest source
+    notes: VTEX; scraper hits /api/catalog_system/pub/products/search
+    match:
+      storage_gb: 256
+      colors: [preto, jetblack]
 
   - id: outletdocelular
     seller: Outlet do Celular
