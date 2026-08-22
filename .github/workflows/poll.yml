@@ -2,9 +2,9 @@ name: poll
 
 on:
   schedule:
-    - cron: '17 * * * *'      # hourly FULL poll (tier 1+2 + promos), odd offset
-    - cron: '2,32,47 * * * *' # extra runs -> every 15 min; tier-1 only, no promos
-    - cron: '0 12 * * *'      # 09:00 BRT (UTC-3): heartbeat + daily tier-3 sweep
+    # Free-tier-safe: ~49 runs/day (~1500 billed min/mo, under the 2000 free tier).
+    - cron: '13,43 * * * *'   # every 30 min: tier-1 refurb poll (fast, no promos)
+    - cron: '0 12 * * *'      # 09:00 BRT (UTC-3): full sweep (all tiers + promos) + heartbeat
   workflow_dispatch:
     inputs:
       mode:
@@ -44,15 +44,15 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Hourly full poll (tier 1+2 + promos)
-        if: github.event.schedule == '17 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'poll')
-        run: python -m src.run --poll
-
-      - name: Frequent poll (every 15 min, tier-1, no promos)
-        if: github.event.schedule == '2,32,47 * * * *'
+      - name: Refurb poll (every 30 min, tier-1, no promos)
+        if: github.event.schedule == '13,43 * * * *'
         run: python -m src.run --poll --tier1 --no-promos
 
-      - name: Daily (tier-3 sweep + heartbeat)
+      - name: Full sweep on demand (all tiers + promos)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'poll'
+        run: python -m src.run --poll
+
+      - name: Daily full sweep + heartbeat
         if: github.event.schedule == '0 12 * * *'
         run: |
           python -m src.run --poll --daily
