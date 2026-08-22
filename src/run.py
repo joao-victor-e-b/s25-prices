@@ -89,24 +89,40 @@ def poll(daily: bool = False, enable_new_low: bool = False,
     return result
 
 
+PROMO_CAP = 10  # max promos verified/alerted per run
+
+
 def _scan_promotions(conn, now: str, dry_run: bool) -> None:
     try:
         promos = promos_mod.scan()
     except Exception as e:  # DDG hiccup must not sink the poll
         print(f"[promo-fail] {e}", file=sys.stderr)
         return
-    fresh = []
-    for pr in promos:
+
+    for pr in promos:            # store ALL found promos for history
         pr.ts = now
         store.insert_promo(conn, pr, now)
-        if store.last_alert(conn, pr.url, "promo", 24, now) is None:
+
+    ceiling = triggers.PRIMARY   # only alert genuinely cheap promos (<= R$4.300)
+    candidates = []
+    for pr in promos:
+        if pr.price is None or pr.price > ceiling:
+            continue
+        prior = store.last_alert(conn, pr.url, "promo", within_hours=None, now=now)
+        if prior is None or (prior["pv"] is not None
+                             and pr.price <= prior["pv"] - triggers.DEDUP_PV_DELTA):
+            candidates.append(pr)
+    candidates.sort(key=lambda p: p.price)
+    candidates = candidates[:PROMO_CAP]
+
+    # maximum-rigor expiry check on the (few) cheap candidates
+    fresh = []
+    for pr in candidates:
+        if promos_mod.is_active(pr.url):
             fresh.append(pr)
-    # cheapest-first, cap per run so a big first batch doesn't spam
-    fresh.sort(key=lambda p: (p.price is None, p.price or 0))
-    PROMO_CAP = 10
-    if len(fresh) > PROMO_CAP:
-        print(f"[promos] capping {len(fresh)} -> {PROMO_CAP} this run")
-        fresh = fresh[:PROMO_CAP]
+        else:
+            print(f"[promo-skip] inactive/expired: {pr.url}")
+
     if fresh and dry_run:
         print(f"[dry-run] {len(fresh)} promo(s) would send:")
         for pr in fresh:
@@ -117,7 +133,7 @@ def _scan_promotions(conn, now: str, dry_run: bool) -> None:
             store.record_alert(conn, pr.url, "promo", pr.price, now)
         print(f"[promos] sent={rep['sent']} wa_ok={rep['wa_ok']} ntfy_ok={rep['ntfy_ok']}")
     else:
-        print(f"[promos] scanned={len(promos)} none new")
+        print(f"[promos] scanned={len(promos)} none new (cheap+active)")
 
 
 def heartbeat() -> dict:
