@@ -1,6 +1,8 @@
 """Alerting — CallMeBot (WhatsApp) primary + ntfy.sh fallback (spec §7)."""
 from __future__ import annotations
 
+import re
+import sys
 import urllib.parse
 
 import requests
@@ -31,6 +33,12 @@ def money(value: float | None) -> str:
     return f"R$ {brl(value)}"
 
 
+def safe_text(text: str | None) -> str:
+    """Scraped free text (aggregator titles like 'R$150 OFF') can carry the same
+    '$<digit>' CallMeBot eats; insert the space money() would have."""
+    return re.sub(r"\$(?=\d)", "$ ", text or "")
+
+
 def format_alert(a: Alert) -> str:
     """Render one alert in the spec §7 layout."""
     o = a.obs
@@ -42,6 +50,10 @@ def format_alert(a: Alert) -> str:
     detail = []
     if o.list_price:
         detail.append(f"list {brl(o.list_price)}")
+    if o.list_price and o.pix_discount:
+        detail.append(f"pix {brl(o.list_price - o.pix_discount)}")
+    if o.coupon:
+        detail.append(f"cupom -{brl(o.coupon)}")
     if o.cashback and o.portal:
         pct = round(o.cashback / o.list_price * 100) if o.list_price else 0
         detail.append(f"-{pct}% {o.portal}")
@@ -58,7 +70,7 @@ def format_alert(a: Alert) -> str:
         juros = "s/juros" if o.interest_flag is False else "c/juros"
         line4 = f"{o.installments_n}x {juros} de {money(o.installment_value)}"
 
-    note = f"[{a.note}]" if a.note else ""
+    note = f"[{safe_text(a.note)}]" if a.note else ""
     lines = [header, price_line, line3, line4, note, o.url]
     return "\n".join(x for x in lines if x)
 
@@ -88,9 +100,17 @@ def send_whatsapp(message: str) -> bool:
     url = _CALLMEBOT_URL + "?" + urllib.parse.urlencode(params)
     try:
         r = requests.get(url, timeout=20)
-        return r.status_code == 200
-    except requests.RequestException:
+    except requests.RequestException as e:
+        # the message can embed the full URL, which carries the apikey
+        print(f"[whatsapp] {type(e).__name__}", file=sys.stderr)
         return False
+    if r.status_code != 200:
+        # CallMeBot explains itself in the body (key invalid, not activated,
+        # rate limit); without this a dead channel is invisible in the logs
+        body = re.sub(r"\s+", " ", r.text or "")[:200]
+        print(f"[whatsapp] HTTP {r.status_code}: {body!r}", file=sys.stderr)
+        return False
+    return True
 
 
 def send_ntfy(message: str, title: str | None = None) -> bool:
@@ -127,11 +147,14 @@ def notify(alerts: list[Alert]) -> dict:
 
 
 def send_heartbeat(best_pv: float | None, sources_polled: int,
-                   scrape_failures: int) -> dict:
-    """Daily 09:00 one-liner making silent scraper decay visible (spec §7)."""
+                   scrape_failures: int, extra: str | None = None) -> dict:
+    """Daily 09:00 one-liner making silent scraper decay visible (spec §7).
+    ``extra`` appends a second line (the Amazon price + coupon summary)."""
     best = money(best_pv) if best_pv is not None else "sem oferta elegível"
     msg = (f"📊 S25 heartbeat — melhor PV: {best} · "
            f"{sources_polled} fontes · {scrape_failures} falhas")
+    if extra:
+        msg = f"{msg}\n{safe_text(extra)}"
     return {
         "wa_ok": send_whatsapp(msg),
         "ntfy_ok": send_ntfy(msg, title="S25 heartbeat"),
@@ -142,18 +165,19 @@ def send_heartbeat(best_pv: float | None, sources_polled: int,
 def format_promo(promo) -> str:
     """One-line promo post (Phase 4b) in the §7 style."""
     price = f" — {money(promo.price)}" if promo.price is not None else ""
-    return f"🔔 Promo S25 Ultra{price}\n{promo.title}\n{promo.source}\n{promo.url}"
+    return (f"🔔 Promo S25 Ultra{price}\n{safe_text(promo.title)}\n"
+            f"{promo.source}\n{promo.url}")
 
 
-def notify_promos(promos: list) -> dict:
-    """Send promo posts, batched, WhatsApp + ntfy (best-effort)."""
-    if not promos:
+def _send_blocks(blocks: list[str], title: str) -> dict:
+    """Pack pre-formatted blocks into WhatsApp-sized messages and send each on
+    both channels (best-effort)."""
+    if not blocks:
         return {"sent": 0, "wa_ok": True, "ntfy_ok": True}
     wa_ok = ntfy_ok = True
     current = ""
     batches = []
-    for pr in promos:
-        block = format_promo(pr)
+    for block in blocks:
         if current and len(current) + len(block) + 2 > _MAX_CHARS:
             batches.append(current)
             current = block
@@ -164,9 +188,42 @@ def notify_promos(promos: list) -> dict:
     for msg in batches:
         if not send_whatsapp(msg):
             wa_ok = False
-        if not send_ntfy(msg, title="S25 promo"):
+        if not send_ntfy(msg, title=title):
             ntfy_ok = False
-    return {"sent": len(promos), "wa_ok": wa_ok, "ntfy_ok": ntfy_ok}
+    return {"sent": len(blocks), "wa_ok": wa_ok, "ntfy_ok": ntfy_ok}
+
+
+def notify_promos(promos: list) -> dict:
+    """Send promo posts, batched, WhatsApp + ntfy (best-effort)."""
+    return _send_blocks([format_promo(pr) for pr in promos], "S25 promo")
+
+
+def format_coupon(code, value: float, price: float) -> str:
+    """A new Amazon checkout code worth trying (``coupons.CouponCode``).
+    Informational: eligibility for marketplace refurb sellers is unverified."""
+    limits = [f for f in code.flags if f in ("prime", "app", "first_purchase", "card")]
+    caveat = "não confirmado p/ vendedor parceiro"
+    if limits:
+        caveat = f"exige {', '.join(limits)} · {caveat}"
+    lines = [
+        f"🎟️ Cupom Amazon {code.key} — até {money(value)} num pedido de {money(price)}",
+        safe_text(code.title),
+        caveat,
+        code.url or "",
+    ]
+    return "\n".join(x for x in lines if x)
+
+
+def format_cashback(s) -> str:
+    """An Amazon cashback portal turned on (``coupons.CashbackStatus``)."""
+    rate = f" {s.rate_pct:g}%" if s.rate_pct else ""
+    lines = [f"💸 Cashback Amazon ativo: {s.portal}{rate}", safe_text(s.detail), s.url]
+    return "\n".join(x for x in lines if x)
+
+
+def notify_coupons(blocks: list[str]) -> dict:
+    """Send coupon/cashback blocks (already formatted), batched."""
+    return _send_blocks(blocks, "S25 cupom")
 
 
 def send_test() -> dict:

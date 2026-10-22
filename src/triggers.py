@@ -123,7 +123,7 @@ def evaluate(conn, observations: list[Observation], now: str,
         hi = max(offers, key=lambda x: x.pv)
         if hi.pv - lo.pv >= 200:
             candidates.append(Alert("venue_spread", PRIORITY["venue_spread"], lo,
-                                    f"spread R${hi.pv - lo.pv:.0f} vs {hi.venue}"))
+                                    f"spread R$ {hi.pv - lo.pv:.0f} vs {hi.venue}"))
 
     return _dedup(conn, candidates, now)
 

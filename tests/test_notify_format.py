@@ -34,3 +34,9 @@ def test_format_contains_expected_lines():
     assert "10x s/juros de R$ 448,19" in msg
     assert "Trocafy · Sou Como Novo" in msg
     assert msg.strip().endswith("p3233")
+
+
+def test_spread_note_has_no_dollar_digit():
+    a = _alert()
+    a.note = "spread R$412 vs own_site"           # old-style note text
+    assert not re.search(r"\$\d", format_alert(a))

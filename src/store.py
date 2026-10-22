@@ -56,6 +56,46 @@ CREATE TABLE IF NOT EXISTS promotions (
   price   NUMERIC,
   PRIMARY KEY (url, ts)
 );
+
+-- Amazon checkout codes seen on coupon aggregators (one row per code; the
+-- first/last_seen window is the history). Informational: never folded into PV.
+CREATE TABLE IF NOT EXISTS coupon_codes (
+  code        TEXT PRIMARY KEY,
+  sources     TEXT,
+  title       TEXT,
+  terms       TEXT,
+  url         TEXT,
+  pct         NUMERIC,
+  abs_off     NUMERIC,
+  cap         NUMERIC,
+  min_order   NUMERIC,
+  until       TEXT,
+  flags       TEXT,
+  active      BOOLEAN,
+  first_seen  TIMESTAMP NOT NULL,
+  last_seen   TIMESTAMP NOT NULL
+);
+
+-- Amazon cashback rate per portal per scan (all 0% since Apr 2026).
+CREATE TABLE IF NOT EXISTS cashback_status (
+  ts        TIMESTAMP NOT NULL,
+  portal    TEXT NOT NULL,
+  store     TEXT NOT NULL,
+  rate_pct  NUMERIC,
+  active    BOOLEAN,
+  PRIMARY KEY (portal, store, ts)
+);
+
+-- One row per poll so the heartbeat can report real failure counts
+-- (stderr in the Actions log is invisible day to day).
+CREATE TABLE IF NOT EXISTS run_log (
+  ts             TIMESTAMP PRIMARY KEY,
+  polled         INTEGER,
+  failures       INTEGER,      -- sources whose fetch raised
+  partial        INTEGER,      -- sources that degraded (e.g. Amazon AOD blocked)
+  coupon_errors  INTEGER,      -- coupon/cashback sites that failed
+  detail         TEXT
+);
 """
 
 
@@ -92,6 +132,97 @@ def insert_promo(conn: sqlite3.Connection, promo, ts: str) -> None:
         "VALUES (?, ?, ?, ?, ?)",
         (ts, promo.source, promo.title, promo.url, promo.price),
     )
+
+
+def upsert_coupon(conn: sqlite3.Connection, c, ts: str) -> bool:
+    """Insert or refresh a coupon code (a ``coupons.CouponCode``). Returns True
+    the first time the code is seen."""
+    row = conn.execute("SELECT sources, first_seen FROM coupon_codes WHERE code=?",
+                       (c.key,)).fetchone()
+    sources = set(c.source.split(","))   # merged codes carry 'promobit,meliuz'
+    if row is not None and row["sources"]:
+        sources |= set(row["sources"].split(","))
+    conn.execute(
+        "INSERT OR REPLACE INTO coupon_codes (code, sources, title, terms, url, pct, "
+        "abs_off, cap, min_order, until, flags, active, first_seen, last_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (c.key, ",".join(sorted(sources)), c.title, c.terms, c.url, c.pct,
+         c.abs_off, c.cap, c.min_order, c.until, ",".join(c.flags), c.active,
+         row["first_seen"] if row is not None else ts, ts),
+    )
+    return row is None
+
+
+def insert_cashback(conn: sqlite3.Connection, s, ts: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO cashback_status (ts, portal, store, rate_pct, active) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (ts, s.portal, s.store, s.rate_pct, s.active),
+    )
+
+
+def cashback_off_since(conn: sqlite3.Connection, portal: str, store: str,
+                       since_ts: str) -> bool:
+    """Was the portal seen inactive after ``since_ts`` (its last alert)? Then
+    turning on again deserves a new ping."""
+    return conn.execute(
+        "SELECT 1 FROM cashback_status WHERE portal=? AND store=? AND ts > ? "
+        "AND NOT active LIMIT 1",
+        (portal, store, since_ts),
+    ).fetchone() is not None
+
+
+def mark_missing_out_of_stock(conn: sqlite3.Connection, source_id: str,
+                              seen: set[str], ts: str, days: int = 7) -> list[str]:
+    """Write an in_stock=0 row for each listing of ``source_id`` whose latest
+    snapshot (within ``days``) is in stock but that this poll didn't return.
+
+    Only for sources that report a *complete* offer list (Amazon's AOD drops a
+    sold-out seller instead of showing it unavailable). Without these rows the
+    vanished offer stays "current" for the heartbeat forever and restock can
+    never fire when it returns. pv is NULL so the row stays out of PV history.
+    """
+    cutoff = (datetime.fromisoformat(ts) - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT o.* FROM observations o
+        JOIN (SELECT listing_id, MAX(ts) AS mts FROM observations
+              WHERE source_id=? GROUP BY listing_id) latest
+        ON o.listing_id=latest.listing_id AND o.ts=latest.mts
+        WHERE o.source_id=? AND o.in_stock=1 AND o.ts >= ? AND o.ts < ?
+        """,
+        (source_id, source_id, cutoff, ts),
+    ).fetchall()
+    marked = []
+    for r in rows:
+        if r["listing_id"] in seen:
+            continue
+        o = Observation.from_row(r)
+        o.ts, o.in_stock, o.pv = ts, False, None
+        insert_observation(conn, o)
+        marked.append(o.listing_id)
+    return marked
+
+
+def insert_run_log(conn: sqlite3.Connection, ts: str, polled: int, failures: int,
+                   partial: int, coupon_errors: int, detail: str = "") -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO run_log (ts, polled, failures, partial, "
+        "coupon_errors, detail) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, polled, failures, partial, coupon_errors, detail),
+    )
+
+
+def run_log_totals(conn: sqlite3.Connection, now: str, hours: int = 24) -> sqlite3.Row:
+    """Summed failure counters over the last ``hours`` (for the heartbeat)."""
+    cutoff = (datetime.fromisoformat(now) - timedelta(hours=hours)).isoformat()
+    return conn.execute(
+        "SELECT COUNT(*) AS runs, COALESCE(SUM(failures), 0) AS failures, "
+        "COALESCE(SUM(partial), 0) AS partial, "
+        "COALESCE(SUM(coupon_errors), 0) AS coupon_errors "
+        "FROM run_log WHERE ts >= ? AND ts <= ?",
+        (cutoff, now),
+    ).fetchone()
 
 
 def record_alert(conn: sqlite3.Connection, listing_id: str, trigger: str,
@@ -152,9 +283,13 @@ def pv_series(conn: sqlite3.Connection, seller: str, grade_rank: int,
     return [row["pv"] for row in cur.fetchall()]
 
 
-def best_current_pv(conn: sqlite3.Connection, min_rank: int = 3) -> sqlite3.Row | None:
+def best_current_pv(conn: sqlite3.Connection, min_rank: int = 3,
+                    venue: str | None = None,
+                    since: str | None = None) -> sqlite3.Row | None:
     """Lowest in-stock PV at acceptable grade, most recent snapshot per listing.
-    Used by the daily heartbeat."""
+    Used by the daily heartbeat (optionally narrowed to one venue, and to
+    listings whose latest snapshot is at/after ``since`` so offers that
+    vanished days ago don't count as current)."""
     cur = conn.execute(
         """
         SELECT o.* FROM observations o
@@ -165,8 +300,9 @@ def best_current_pv(conn: sqlite3.Connection, min_rank: int = 3) -> sqlite3.Row 
         ON o.source_id=latest.source_id AND o.listing_id=latest.listing_id
         AND o.ts=latest.mts
         WHERE o.in_stock=1 AND o.grade_rank >= ? AND o.pv IS NOT NULL
+          AND (? IS NULL OR o.venue = ?) AND (? IS NULL OR o.ts >= ?)
         ORDER BY o.pv ASC LIMIT 1
         """,
-        (min_rank,),
+        (min_rank, venue, venue, since, since),
     )
     return cur.fetchone()

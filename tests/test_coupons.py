@@ -34,9 +34,11 @@ def test_amazon_no_coupon_widget_yields_zero():
 
 
 def test_amazon_coupon_widget_parsed():
+    # price inside the buybox's apex block (a stray a-price elsewhere is ignored)
     html = (b"<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto"
-            b"</span><span class='a-price'><span class='a-offscreen'>R$4.500,00"
-            b"</span></span><div id='couponsInBuybox_feature_div'>"
+            b"</span><div id='corePrice_feature_div'><span class='a-price'>"
+            b"<span class='a-offscreen'>R$4.500,00</span></span></div>"
+            b"<div id='couponsInBuybox_feature_div'>"
             b"Economize R$ 250,00 com cupom</div></body></html>")
     src = AmazonSeminovosSource({"id": "amazon_seminovos", "asin": "X",
                                  "url": "https://www.amazon.com.br/dp/X"})
