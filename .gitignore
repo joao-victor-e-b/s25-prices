@@ -17,9 +17,13 @@ Thumbs.db
 
 # Local scratch
 *.log
+# the PC watcher's daily logs (scripts/local_watcher.ps1)
+logs/
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+# one watcher loop per DB (run.acquire_lock)
+data/*.lock
 
 # Claude Code local state
 .claude/scheduled_tasks.lock

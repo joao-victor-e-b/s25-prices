@@ -13,7 +13,9 @@ threshold alert needs a 12x total at least DEDUP_DELTA_12X below the lowest
 one already sent for the listing since it was last stored sold out, unless it
 climbs into a stronger level than any sent; a rise never alerts. Other
 triggers repeat only on a DEDUP_PV_DELTA PV drop. A listing that sold out and
-came back starts fresh (single-unit refurb offers come and go).
+came back starts fresh (single-unit refurb offers come and go). 🟢 restock is
+judged on what was sent, not on the previous stored row (``_restocked``), so
+a poll that stores a return without announcing it can't swallow it.
 
 The multi-store triggers (new_low, grade_upgrade, venue_spread,
 trocafy_review) never apply to Amazon offers: in Amazon-only mode they would
@@ -26,7 +28,9 @@ ungraded. It gets its own alert (and its own per-ASIN ladder) rather than a
 threshold alert, because nothing says the offer is Excelente — the user has to
 look. An offer we already know — seen this poll, or stored in stock within
 UNSEEN_KNOWN_HOURS (the panel works on and off in CI, and the buybox rotates)
-— never passes for a hidden one.
+— never passes for a hidden one, and an offer already announced by name
+(🔴/🟠/🟡, e.g. by the PC watcher, whose panel works) is a rung of the 🔍
+ladder.
 """
 from __future__ import annotations
 
@@ -46,6 +50,10 @@ ALERT_MIN_RANK = 4    # Excelente/Premium and better (normalize.MIN_RANK stays 3
 # A restock is only worth a ping near the user's range: new-unit listings carry
 # many sellers at R$ 6-10k that come and go (the old R$ 4.300 "primary" level).
 RESTOCK_MAX_12X = 4300
+# ...and only while the return is recent: an unannounced restock (the cloud
+# stood by while the PC was away, an outage) is still sent this long after
+# the listing came back — more than run.LOCAL_FRESH_MIN plus a 30-min sync.
+RESTOCK_WINDOW = timedelta(hours=2)
 
 DEDUP_PV_DELTA = 100   # R$; non-threshold triggers re-fire only on a PV drop this big
 DEDUP_DELTA_12X = 50   # R$; threshold triggers re-fire on a 12x-total drop this big
@@ -146,11 +154,10 @@ def evaluate(conn, observations: list[Observation], now: str,
             if ta:
                 candidates.append(ta)
 
-            # 5: restock (in_stock flips false -> true), near the user's range
-            prev = store.last_observation(conn, o.source_id, o.listing_id, now)
+            # 5: restock, near the user's range (``_restocked``)
             total = card_total(o)
-            if (prev is not None and not prev["in_stock"]
-                    and total is not None and total <= RESTOCK_MAX_12X):
+            if (total is not None and total <= RESTOCK_MAX_12X
+                    and _restocked(conn, o.listing_id, now)):
                 candidates.append(Alert("restock", PRIORITY["restock"], o,
                                         "voltou ao estoque"))
 
@@ -199,6 +206,26 @@ def evaluate(conn, observations: list[Observation], now: str,
                                     f"spread R$ {hi.pv - lo.pv:.0f} vs {hi.venue}"))
 
     return _dedup(conn, _fold_restock(candidates), now)
+
+
+def _restocked(conn, listing_id: str, now: str) -> bool:
+    """Is the (in-stock) listing back from a sell-out that nobody announced
+    yet? Level-based, not an edge on the previous stored row: it was stored
+    sold out, no restock or threshold alert (``_fold_restock`` records the
+    threshold trigger) was delivered for it since, and it came back within
+    RESTOCK_WINDOW. A poll that stores the in-stock row without announcing it
+    (the cloud's standby, an outage) therefore can't swallow the 🟢: the next
+    poll that sends still sees it. The window keeps a listing in stock for
+    days that drifts under RESTOCK_MAX_12X from passing for a return."""
+    oos = store.last_out_of_stock(conn, listing_id, now)
+    if oos is None or store.alerted_since(conn, listing_id,
+                                          ("restock",) + THRESHOLD_TRIGGERS, oos, now):
+        return False
+    back = store.first_in_stock_after(conn, listing_id, oos, now) or now
+    try:
+        return datetime.fromisoformat(now) - datetime.fromisoformat(back) <= RESTOCK_WINDOW
+    except (TypeError, ValueError):
+        return False
 
 
 def _fold_restock(candidates: list[Alert]) -> list[Alert]:
@@ -324,18 +351,41 @@ def unseen_offers(conn, summaries: list[OfferSummary], observations: list[Observ
     return out
 
 
+def _named_alert_values(conn, asin: str, since: str | None, now: str) -> list[float]:
+    """12x totals of the price-threshold alerts (🔴/🟠/🟡) sent for the ASIN's
+    named listings (``<ASIN>:<seller>:<grade>``) after ``since`` and up to
+    ``now``, leaving out listings stored sold out since their alert. A cheap
+    offer the PC watcher's panel named and announced stays behind the "a
+    partir de" line after the PC stops, unnamed from the cloud: once its
+    stored row is UNSEEN_KNOWN_HOURS old it must not come back as 🔍."""
+    marks = ",".join("?" * len(THRESHOLD_TRIGGERS))
+    rows = conn.execute(
+        f"SELECT listing_id, ts, pv FROM alerts_sent WHERE listing_id LIKE ? "
+        f"AND trigger IN ({marks}) AND (? IS NULL OR ts > ?) AND ts <= ?",
+        (f"{asin}:%", *THRESHOLD_TRIGGERS, since, since, now)).fetchall()
+    return [r[2] for r in rows if r[2] is not None
+            and not store.out_of_stock_since(conn, r[0], r[1], now)]
+
+
 def _unseen_repeat(conn, a: UnseenOfferAlert, now: str) -> bool:
     """The threshold ladder (``_threshold_repeat``) per ASIN: compared with the
     🔍 alerts sent since a reading last showed an offer leave (the page lost
     its line, or the count fell with nothing left within YEAR_LOW_12X —
     ``store.last_offer_departure``, the analogue of a sell-out), it passes
     only DEDUP_DELTA_12X below the lowest of them or at a stronger level; a
-    rise never alerts, and neither does a price bouncing across the ceiling."""
+    rise never alerts, and neither does a price bouncing across the ceiling.
+    Threshold alerts already sent for the ASIN's named offers since then
+    (``_named_alert_values``) count as rungs too: an offer's 🔍 metric (card
+    + shipping) is its 12x total or more, give or take the cents of a plan
+    rebuilt from installments, so an offer already announced by name stays
+    quiet, while one DEDUP_DELTA_12X cheaper or at a stronger level still
+    fires."""
     since = store.last_offer_departure(conn, a.summary.asin, YEAR_LOW_12X, now)
     priors = store.threshold_alerts(conn, a.key, (a.trigger,), since, now)
-    if not priors:
+    named = _named_alert_values(conn, a.summary.asin, since, now)
+    if not priors and not named:
         return False
-    values = [v for _, v in priors if v is not None]
+    values = [v for _, v in priors if v is not None] + named
     if not values:
         return True   # can't confirm a drop -> suppress
     if _STRENGTH[a.level] > max(_STRENGTH.get(threshold_level(v), 0) for v in values):

@@ -27,7 +27,11 @@ How a sync goes:
   with short git timeouts: the runner kills the job ~10 s after asking it to
   stop;
 - nothing raises and every git call has a timeout: a failed sync is logged and
-  simply retried at the next one while the watcher keeps polling.
+  simply retried at the next one while the watcher keeps polling;
+- the pull before the first poll (``pull_latest``) turns into a full sync
+  when the checkout holds what an interrupted run left (DB rows never
+  committed, a snapshot never pushed): the PC watcher's clone outlives its
+  runs, unlike a CI checkout.
 
 Every git command goes through an injectable ``runner`` so tests need no repo.
 """
@@ -250,16 +254,37 @@ def _sync_db(db_path, runner, retries, now, sleep, final, merge_fn, export_fn,
     return False
 
 
-def pull_latest(runner: Runner | None = None) -> bool:
+def pull_latest(runner: Runner | None = None, db_path: Path | None = None,
+                sync_fn: Callable[..., bool] | None = None) -> bool:
     """Bring the checkout up to date before the first poll: a queued watcher's
     checkout predates the previous watcher's final snapshots, and polling on
-    that stale DB would re-send alerts it already sent. Never raises."""
+    that stale DB would re-send alerts it already sent. Never raises.
+
+    A CI checkout is always clean, but the PC watcher's clone keeps what a
+    run killed before its exit sync (shutdown, logoff) left behind: DB rows
+    never committed, or a snapshot commit never pushed. A plain pull mishandles
+    both — autostash parks the rows in a stash and leaves the DB unmerged at
+    upstream's version (exit 0), and the snapshot commit stops the rebase on
+    the binary DB — so then the regular sync (``sync_fn``, default
+    ``sync_db``: commit, pull, row merge on a DB conflict, push) runs instead,
+    and the first poll sees both watchers' rows."""
     run = runner or default_runner
+    sync = sync_fn or sync_db
+    db = Path(db_path or config.DB_PATH)
+    rel = _repo_relative(db)
+    if rel is not None and run(["git", "diff", "--quiet", "HEAD", "--", rel]).returncode != 0:
+        print("[git-sync] the DB holds rows an interrupted run never synced: "
+              "syncing them before the first poll")
+        return sync(db, runner=runner)
     cp = run(["git", "pull", "--rebase", "--autostash"])
     if cp.returncode == 0:
         print("[git-sync] up to date before the first poll")
         return True
     run(["git", "rebase", "--abort"])
+    if rel is not None and _ahead(run):
+        print(f"[git-sync] pull before the first poll failed with unpushed commits "
+              f"({_why(cp)}): syncing them (row merge on a DB conflict)")
+        return sync(db, runner=runner)
     print(f"[git-sync] WARNING: pull before the first poll failed; polling on the "
           f"checked-out DB: {_why(cp)}")
     return False

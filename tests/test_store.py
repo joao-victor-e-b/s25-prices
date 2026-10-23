@@ -123,10 +123,14 @@ def test_restock_still_fires_with_skipping(conn):
     store.mark_missing_out_of_stock(conn, "amazon_seminovos", set(), _at(4))
     back = _obs(_at(8), list_price=4200.0)                    # same price, back in stock
     assert store.insert_observation(conn, back) is True       # in_stock changed
-    assert "restock" in {a.trigger for a in triggers.evaluate(conn, [back], _at(8))}
+    (a,) = [x for x in triggers.evaluate(conn, [back], _at(8)) if x.trigger == "restock"]
     again = _obs(_at(12), list_price=4200.0)
     assert store.insert_observation(conn, again) is False     # unchanged -> skipped
-    assert "restock" not in {a.trigger for a in triggers.evaluate(conn, [again], _at(12))}
+    # not delivered yet: still a restock (judged on alerts_sent, not the last row)
+    assert "restock" in {x.trigger for x in triggers.evaluate(conn, [again], _at(12))}
+    store.record_alert(conn, a.obs.listing_id, a.trigger, a.metric, _at(12))
+    later = _obs(_at(16), list_price=4200.0)
+    assert "restock" not in {x.trigger for x in triggers.evaluate(conn, [later], _at(16))}
 
 
 # --- offer promos / current offers -------------------------------------------------

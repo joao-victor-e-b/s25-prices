@@ -235,11 +235,87 @@ def test_final_sync_is_one_fast_attempt():
 
 def test_pull_latest():
     git = FakeGit()
-    assert gitsync.pull_latest(runner=git) is True
-    assert git.calls == [["git", "pull", "--rebase", "--autostash"]]
-    git = FakeGit(pull=[1])
-    assert gitsync.pull_latest(runner=git) is False
-    assert git.verbs() == ["pull", "rebase"]          # aborted, never -X theirs
+    assert gitsync.pull_latest(runner=git, db_path=DB) is True
+    assert git.calls == [["git", "diff", "--quiet", "HEAD", "--", "data/prices.db"],
+                         ["git", "pull", "--rebase", "--autostash"]]
+    git = FakeGit(pull=[1], ahead="0")                # nothing local to merge
+    assert gitsync.pull_latest(runner=git, db_path=DB) is False
+    assert git.verbs() == ["diff", "pull", "rebase", "rev-list"]   # aborted, never -X theirs
+
+
+# --- the PC watcher's clone outlives its runs (local role, Oct 2026) ------------
+
+def test_pull_latest_syncs_rows_an_interrupted_run_left_uncommitted():
+    git, synced = FakeGit(diff=[1]), []               # the DB differs from HEAD
+    ok = gitsync.pull_latest(runner=git, db_path=DB,
+                             sync_fn=lambda db, runner=None: synced.append(db) or True)
+    assert ok is True and synced == [DB]
+    assert git.verbs() == ["diff"]                    # no autostash pull at all
+
+
+def test_pull_latest_syncs_an_unpushed_snapshot_when_the_pull_fails():
+    git, synced = FakeGit(pull=[1], ahead="1"), []
+    ok = gitsync.pull_latest(runner=git, db_path=DB,
+                             sync_fn=lambda db, runner=None: synced.append(db) or True)
+    assert ok is True and synced == [DB]
+    assert git.verbs() == ["diff", "pull", "rebase", "rev-list"]
+
+
+def _repo_pair(tmp_path):
+    """remote + clone ``cloud`` (pushed a row after ``pc`` last synced) +
+    clone ``pc``; both DBs start with row X."""
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    cloud, pc = tmp_path / "cloud", tmp_path / "pc"
+    _clone(remote, cloud)
+    _git(cloud, "checkout", "-b", "main")
+    (cloud / ".gitattributes").write_text("*.db binary\n")
+    (cloud / "data").mkdir()
+    _add_row(cloud / "data" / "prices.db", "X", "2026-10-23T05:00:00+00:00")
+    _git(cloud, "add", ".")
+    _git(cloud, "commit", "-m", "base")
+    _git(cloud, "push", "-u", "origin", "main")
+    _clone(remote, pc)
+    _add_row(cloud / "data" / "prices.db", "CLOUD-night", "2026-10-23T06:00:00+00:00")
+    _git(cloud, "commit", "-am", "cloud snapshot")
+    _git(cloud, "push")
+    return remote, pc
+
+
+def _rows_on_remote(remote, tmp_path):
+    check = tmp_path / "check"
+    _clone(remote, check)
+    conn = store.connect(check / "data" / "prices.db")
+    try:
+        return ({r[0] for r in conn.execute("SELECT listing_id FROM observations")},
+                {r[0] for r in conn.execute("SELECT listing_id FROM alerts_sent")})
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_pc_shut_down_mid_loop_rows_are_merged_not_stashed(tmp_path, monkeypatch):
+    """The PC's run was killed after polling (rows in the DB, no commit) while
+    the cloud pushed: a plain autostash pull would exit 0 with those rows in
+    a stash and the DB unmerged. pull_latest merges and pushes them."""
+    remote, pc = _repo_pair(tmp_path)
+    _add_row(pc / "data" / "prices.db", "PC-last", "2026-10-23T05:50:00+00:00")
+    monkeypatch.setattr(gitsync, "REPO_ROOT", pc)
+    assert gitsync.pull_latest(db_path=pc / "data" / "prices.db") is True
+    assert _git(pc, "status", "--porcelain").stdout == ""
+    assert _git(pc, "stash", "list").stdout == ""
+    assert _rows_on_remote(remote, tmp_path) == ({"X", "CLOUD-night", "PC-last"},) * 2
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_pc_snapshot_that_never_pushed_is_merged(tmp_path, monkeypatch):
+    remote, pc = _repo_pair(tmp_path)
+    _add_row(pc / "data" / "prices.db", "PC-last", "2026-10-23T05:50:00+00:00")
+    _git(pc, "commit", "-am", "data: price snapshot (push failed)")
+    monkeypatch.setattr(gitsync, "REPO_ROOT", pc)
+    assert gitsync.pull_latest(db_path=pc / "data" / "prices.db") is True
+    assert _rows_on_remote(remote, tmp_path) == ({"X", "CLOUD-night", "PC-last"},) * 2
 
 
 def _git(cwd, *args):

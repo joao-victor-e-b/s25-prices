@@ -21,7 +21,7 @@ retailers; since Oct 2026 it runs in **Amazon-only mode** (see below).
 | 🏷️ Nova promoção Amazon | Amazon starts showing a discount message on an eligible offer whose 12x total is ≤ R$ 4.300, or that the message's stated amount would take to ≤ R$ 3.919 (never the everyday "à vista no Pix ou NuPay (5% off)" line) — once per offer + message, one alert per ASIN for all sellers showing it |
 | 🎟️ Cupom Amazon | an aggregator lists a new checkout code worth ≥ R$ 100 at the current price — marked **"não validado"** |
 | 💸 Cashback | an Amazon cashback portal turns on |
-| 🟢 restock | an eligible offer whose 12x total is ≤ R$ 4.300 comes back in stock (folded into the 🔴/🟠 alert when it returns at one of those prices) |
+| 🟢 restock | an eligible offer whose 12x total is ≤ R$ 4.300 comes back in stock (folded into the 🔴/🟠 alert when it returns at one of those prices). Judged on what was sent, not on the previous stored row: it was stored sold out, nothing was sent for it since, and it came back within the last 2 h (`triggers.RESTOCK_WINDOW`) — so a poll that stored the return without announcing it (the cloud on standby, an outage) can't swallow it |
 
 - **Eligible** = in stock and grade rank ≥ 4 (`triggers.ALERT_MIN_RANK`):
   Amazon's *Premium*, *Excelente*, *Usado - Como novo* (4) and *Novo* (5)
@@ -45,8 +45,12 @@ retailers; since Oct 2026 it runs in **Amazon-only mode** (see below).
   *left* (`store.last_offer_departure`, the analogue of a sell-out): the
   product page lost its line (only the buybox was left), or the line's count
   fell with nothing ≤ R$ 3.919 left. A price bouncing across R$ 3.919 at the
-  same count (3.915 → 3.925 → 3.915) is a reprice and alerts once. Also
-  recorded only after delivery; `--dry-run` prints it and records nothing.
+  same count (3.915 → 3.925 → 3.915) is a reprice and alerts once. A
+  🔴/🟠/🟡 already sent since then for one of the ASIN's named offers is a
+  rung of that ladder too (unless the offer was stored sold out since): an
+  offer the [PC watcher](#watcher-no-pc) announced by name isn't announced
+  again as 🔍 by the cloud once the PC is gone. Also recorded only after
+  delivery; `--dry-run` prints it and records nothing.
 
 Example:
 
@@ -258,8 +262,11 @@ python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800 --git-
   DuckDuckGo deal scan is off in loop mode; CDI is fetched once per loop;
 - `--git-sync` pulls before the first poll (a queued run's checkout predates
   the previous watcher's final snapshot), then commits + pushes
-  `data/prices.db` every 30 min (a failed sync is logged, never fatal) and
-  once more on exit, with both stop signals ignored: the normal retrying sync
+  `data/prices.db` every 30 min — just before the poll that falls due, so it
+  judges dedup on what the other watcher pushed meanwhile; 30 min by the
+  loop clock or the wall clock, whichever ran further (a failed sync is
+  logged, never fatal) — and once more on exit, with both stop signals
+  ignored: the normal retrying sync
   within 3 min when the time budget ran out, one fast attempt after
   SIGINT/SIGTERM or a crash. Each sync: `git add` → commit "data: price
   snapshot <UTC>" (skipped when nothing changed) → `git pull --rebase`
@@ -284,9 +291,180 @@ daily 09:00 BRT heartbeat: best eligible offer as "12x de R$ X (total R$ Y)"
 seminovo listings (`Ofertas: 256GB N (menor R$ X) · 512GB N (menor R$ Y)`,
 skipped when `offer_summary` has nothing from the last 48h), the best
 untested codes worth ≥ R$ 100, and the last 24h of polls/failures from
-`run_log`. The heartbeat
+`run_log` — `(PC ativo N, nuvem M)` when the [PC watcher](#watcher-no-pc)
+polled in those 24h, `(só nuvem)` when only the cloud did. The heartbeat
 job fails (exit 1) when neither channel delivered, so a dead secret or relay
 shows up as a red run and a GitHub email.
+
+## Watcher no PC
+
+**Why.** From GitHub's IPs Amazon answers the All Offers panel with 503 nearly
+every time ([CI limitation](#ci-limitation-the-offers-panel)): the cloud can name
+only the buybox seller and falls back on 🔍 for the rest. From a home IP the
+panel loads and every seller is stored. So the same loop also runs on the
+user's Windows PC, from a dedicated clone started by Task Scheduler, while the
+cloud watcher keeps running 24/7. (A GitHub self-hosted runner was ruled out:
+the repo is public, and on a public repo a fork's pull request could run code
+on the PC.)
+
+**How the two coexist.**
+
+- Each poll writes its role to `run_log.host`: `--role` / `S25_ROLE`,
+  `cloud` (default, GitHub Actions) or `local` (the PC). Anything else is
+  refused at start. It also writes `run_log.ok`: whether it could see and
+  alert — some source answered, Amazon didn't block it hard (a captcha, a
+  fetch that raised), and every alert it sent reached a channel.
+- **Standby.** While the DB holds a *healthy* `local` poll (`ok`) at most
+  **45 min** old (`run.LOCAL_FRESH_MIN`), a cloud poll still fetches and
+  stores everything (observations, offer lines, promotion messages, codes,
+  cashback, run_log) but sends **nothing** — no 🔴/🟠/🟡/🟢, 🔍, 🏷️, 🎟️, 💸
+  or DDG promo — and records no `alerts_sent`. It prints `[standby] local
+  watcher active (last poll <ts>)` and notes `standby: local poll <ts>` in its
+  `run_log.detail`. Nothing is swallowed: an alert is recorded only once
+  delivered, and 🟢 is judged on what was sent rather than on the previous
+  stored row, so whatever is still news when the cloud takes over goes out
+  then. The PC never stands by.
+- **Only a PC that can do the job holds the cloud.** A blind PC (Amazon
+  serving the home IP a captcha) or a mute one (a stale `.env`: nothing
+  delivered) keeps logging polls, but with `ok = 0`: the cloud takes over 45
+  min after the PC's last good poll, or as soon as it sees the PC's last 3
+  polls all failed (`[standby] off: the PC's last 3 polls failed ...`). A PC
+  watcher with no channel configured at all refuses to start: `--role local`
+  exits 2 with `no alert channel configured` (`LastTaskResult` 2).
+- **How the cloud knows.** Both watchers push the DB every 30 min and merge
+  each other's rows on the (now routine) conflict, so `alerts_sent` — the
+  dedup state — flows both ways; each sync runs just before the poll that
+  falls due, so that poll already judges on the other's latest rows. Two
+  independent 30-min cycles alone would leave the cloud judging the PC on
+  polls up to ~1 h old, dropping a live PC's standby for part of most
+  cycles; so the PC also pushes right after its **first** poll, and a cloud
+  loop whose standby is about to lapse **syncs before its next poll**
+  (`run.loop`), judging the PC on what it last pushed.
+- **Clocks.** Polls are stamped in UTC by each watcher's own clock. A local
+  poll stamped more than 5 min after the cloud's clock (the PC's clock runs
+  ahead) is ignored and logged — `[standby] ignoring local poll(s) from the
+  future (<ts>): PC clock ahead?` — and a standby never lasts more than 45
+  min past a poll. A PC clock running *behind* can't be told from a late
+  push, and would make the cloud take the PC for gone between its pushes
+  (both send): keep the PC's time synced automatically (Setup, step 6).
+- **Handover.** When the PC starts, the cloud stands by from its next sync,
+  within ~40 min (first rollout: only once the cloud runs a job started
+  after this change was pushed — Setup, step 0); in that window both send,
+  and a duplicate needs the same alert on both before either's
+  `alerts_sent` row reached the other — rare. When the PC stops (shutdown,
+  logoff, sleep), the cloud takes over 45 min after the PC's last pushed
+  poll (one cloud poll later at most), so ≤ ~50 min after it went down;
+  meanwhile nobody sends, but nothing is lost. An offer the PC announced by
+  name (🔴/🟠/🟡) stays a rung of the cloud's 🔍 ladder, so the cloud
+  doesn't announce it again as a hidden offer once the PC's row is too old
+  to vouch for it. A run ending normally (its 5h45 budget) is followed by
+  the next one within 30 min, which pushes after its first poll: the cloud
+  never notices.
+- **Sleep and wake.** A laptop that sleeps mid-run suspends the loop inside
+  its wait, while the cloud takes over and may alert. On waking the loop
+  sees the wall clock jumped (`[loop] resumed after Ns asleep`), syncs
+  *before* it polls — merging what the cloud sent meanwhile, so nothing is
+  repeated — and pushes again right after that poll, so the cloud stands by
+  again from its next sync. A run whose 5h45 budget passed while asleep
+  stops at once (exit sync, no poll); the next 30-min tick starts a fresh
+  one.
+- **Network not up yet.** The task starts 2 min after log on and only with
+  a network; the loop's first pull is retried for ~4 min (15/30/60/120 s).
+  If it still fails — or the sync after a wake does — the PC polls
+  **store-only** (`[hold] the DB couldn't be synced yet`, `hold: DB not
+  synced` in `run_log.detail`) and tries a sync before each poll; the first
+  one that works turns alerts back on, judged on the merged DB. A PC that
+  can't push at all never alerts — nor does it put the cloud on standby.
+- **Interrupted runs.** A run killed mid-loop (shutdown, logoff) leaves DB
+  rows uncommitted in the clone. The next start merges them into upstream's
+  DB before its first poll (`gitsync.pull_latest`), so the PC doesn't repeat
+  alerts it sent just before going down; a plain `git pull --autostash` would
+  have parked them in a stash and left the DB unmerged.
+- **One loop per clone.** `--loop` holds `data/prices.db.lock` (an OS lock,
+  gone with the process, gitignored); a second loop on the same DB exits at
+  once (`[loop] another watcher holds ...`), and the wrapper exits before
+  pulling while a python from an earlier start still holds it. The wrapper
+  also puts itself in a kill-on-close job object, so when Task Scheduler
+  stops a run (the 6 h limit, End) python stops with it — without its exit
+  sync; the next start merges its rows.
+
+The clone updates itself: each start pulls (`scripts/local_watcher.ps1`) and
+the loop pulls at every sync. A new `coupon_checks.yaml` or `registry.yaml`
+counts from the next poll, new code from the next start (≤ 6 h).
+
+**Setup** (PowerShell; `<user>` is your Windows user):
+
+0. **First rollout only.** Once this change is on GitHub, the `watch` run
+   already in progress keeps the old code — no standby — until it ends, up
+   to 5h45, and both watchers would send. Before step 5, cancel it: Actions
+   > watch > Cancel run, or
+   `gh run list --workflow poll.yml --status in_progress` then
+   `gh run cancel <id>`. The exec'd loop still does its exit sync, and a
+   queued or the next cron run starts within 30 min with the new code.
+   Alternatively, wait until the running job is one that started after the
+   push.
+1. Clone a dedicated copy — not your working copy: the watcher commits,
+   rebases and pushes there.
+   ```powershell
+   git clone https://github.com/joao-victor-e-b/s25-prices.git C:\Users\<user>\s25-watcher
+   ```
+2. Copy your `.env` (the secrets) into it — without a channel in it the
+   watcher refuses to start:
+   `Copy-Item C:\Users\<user>\s25-prices\.env C:\Users\<user>\s25-watcher\`
+3. Give the Python the task will use the requirements:
+   `& C:\Users\<user>\anaconda3\python.exe -m pip install -r C:\Users\<user>\s25-watcher\requirements.txt`
+4. Check that git can push from the clone without asking (Git Credential
+   Manager remembers the login; the task turns prompts off, so a missing
+   credential only shows up as `[git-sync] push failed` in the log):
+   `git -C C:\Users\<user>\s25-watcher push --dry-run`
+5. Register the task (no admin needed; run again to update it):
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<user>\s25-watcher\scripts\install_local_watcher.ps1 -Python C:\Users\<user>\anaconda3\python.exe
+   ```
+   Task **S25 Amazon watcher**, for your user: 2 min after log on and every
+   30 min from now on, one run at a time (a start while a loop runs is
+   ignored), only while you are logged on and a network is up, on battery
+   too, stopped after 6 h at most (python with it: the job object). Each
+   run is `scripts/local_watcher.ps1`: `git pull --rebase --autostash`
+   (skipped when the DB holds an interrupted run's rows; never fatal), then
+   `python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800
+   --git-sync --role local`, exiting with python's code. Without `-Python`
+   it takes the first `python` on PATH (resolved now, warning if it is the
+   Microsoft Store alias). To start right away:
+   `Start-ScheduledTask -TaskName 'S25 Amazon watcher'`. A console window
+   may flash for a moment when a run starts (about every 6 h).
+6. Keep the PC's clock synced: Configurações > Hora e idioma > Data e hora >
+   **Definir horário automaticamente** on (the default). A clock running
+   behind makes the cloud take the PC for gone between its pushes.
+
+**Logs.** `C:\Users\<user>\s25-watcher\logs\watcher-YYYYMMDD.log`, named for
+the day a run *started*: a run that starts late in the evening keeps writing
+to that day's file until it ends, up to ~5h45 later
+(`watcher-YYYYMMDD-HHmmss.log` when a leftover process still holds the
+day's file). UTF-8 with a BOM, gitignored, deleted after 30 days:
+`[wrapper]` lines, then the loop's stdout + stderr (`[amazon] requests=N
+aod_ok=x/y ...` — `aod_ok` should be mostly `y/y` from home). Follow the
+newest one live (`-Encoding UTF8`: Windows PowerShell 5.1 would garble the
+accents and emoji otherwise):
+
+```powershell
+Get-ChildItem C:\Users\<user>\s25-watcher\logs\watcher-*.log | Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content -Encoding UTF8 -Wait -Tail 40
+Get-ScheduledTask -TaskName 'S25 Amazon watcher' | Get-ScheduledTaskInfo   # LastTaskResult = python's exit code
+```
+
+From elsewhere: the heartbeat's `(PC ativo N, nuvem M)`, the `[standby]`
+lines in the watch workflow's log, or `SELECT host, ok, COUNT(*) FROM
+run_log GROUP BY host, ok`.
+
+**Uninstall.**
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<user>\s25-watcher\scripts\install_local_watcher.ps1 -Uninstall
+```
+
+Removing the task doesn't stop a run in progress: it may finish its loop
+(≤ 5h45) and push a last snapshot; the cloud takes over 45 min after the
+PC's last pushed poll. Delete the clone once no `python.exe` runs from it.
 
 ## Layout
 
@@ -304,8 +482,11 @@ src/
   notify.py                  CallMeBot + ntfy message formats
   store.py                   SQLite schema, migrations, snapshot skipping
   gitsync.py                 commit/pull/push of the DB from inside the loop
-  run.py                     orchestrator / CLI / watcher loop
-data/prices.db               committed price history (written only by the watch job)
+  run.py                     orchestrator / CLI / watcher loop (+ the cloud's standby)
+scripts/
+  local_watcher.ps1          one PC watcher run (role local), logged to logs/
+  install_local_watcher.ps1  registers / removes the "S25 Amazon watcher" task
+data/prices.db               committed price history (written only by the watchers)
 tests/                       unit tests (no network)
 ```
 
@@ -346,6 +527,7 @@ python -m src.run --poll             # one poll cycle (+ DDG promos + coupon swe
 python -m src.run --poll --dry-run   # evaluate + print alerts, send nothing
 python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800 --git-sync
 python -m src.run --loop --minutes 10 --interval 60 --dry-run   # local loop, sends nothing
+python -m src.run --poll --role local   # as the PC watcher (needs a channel; default: S25_ROLE, else cloud)
 python -m src.run --heartbeat        # daily summary
 python -m src.run --poll --enable-new-low   # after ~30 days of history
 ```

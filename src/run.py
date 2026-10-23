@@ -8,6 +8,7 @@ Usage:
   python -m src.run --poll --daily     also include tier-3 (daily) sources
   python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800 --git-sync
                                        the watcher (see ``loop``)
+  ... --role local                     the PC watcher (default: S25_ROLE, else cloud)
 
 Why a loop: GitHub's cron fires every 5 minutes at best and is routinely late
 by 10-30, while a refurb offer at a good price can sell out within the hour.
@@ -17,6 +18,15 @@ pushes back) and committing the DB every 30 minutes (gitsync.py); the next
 scheduled run is already queued behind it. A registry entry with ``every: N``
 is polled on every Nth loop iteration only (the four new-unit ASINs use 3), so
 one poll never fetches more than ~6 ASINs.
+
+Two watchers (``--role``, S25_ROLE): the cloud loop above runs 24/7, and the
+user's PC can run the same loop from a home IP (``--role local``,
+scripts/local_watcher.ps1), where Amazon serves the full offers panel. Every
+poll logs its role in run_log.host and its health in run_log.ok; while the DB
+holds a healthy local poll younger than LOCAL_FRESH_MIN, a cloud poll stands
+by: it fetches and stores as usual but sends nothing and records no
+alerts_sent (``_local_watcher``). A PC watcher with no alert channel refuses
+to start, and one loop at a time runs per DB (``acquire_lock``).
 """
 from __future__ import annotations
 
@@ -30,6 +40,7 @@ import threading
 import time
 import traceback
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import yaml
 
@@ -67,14 +78,92 @@ def _due(cfg: dict, iteration: int) -> bool:
     return iteration % every == 0
 
 
+LOCAL_FRESH_MIN = 45     # a healthy local poll this recent puts the cloud on standby
+LOCAL_SICK_POLLS = 3     # ...unless the PC's latest this many polls all failed
+LOCAL_SKEW_TOL_MIN = 5   # local polls stamped further ahead than this are ignored
+
+
+def _local_watcher(conn, now: str) -> tuple[str, float] | None:
+    """(ts, seconds left) of the PC watcher's latest *healthy* poll
+    (run_log.ok: a source answered, Amazon didn't block it hard, every send
+    was delivered) while it is at most LOCAL_FRESH_MIN old at ``now``; None
+    when there is none that fresh.
+
+    - A PC that is blind (a captcha on the home IP) or mute (a stale .env)
+      keeps logging polls; they don't hold the cloud. It takes over
+      LOCAL_FRESH_MIN after the PC's last good poll, or at once when the PC's
+      LOCAL_SICK_POLLS latest polls all failed.
+    - Clock skew: a local poll stamped more than LOCAL_SKEW_TOL_MIN after
+      ``now`` (the PC's clock runs ahead) is ignored, and reported, so it
+      can't stretch the standby; the time left never exceeds LOCAL_FRESH_MIN.
+      A PC clock running behind can't be told from a late push: the README
+      asks for automatic time sync on the PC.
+
+    The cloud only sees local polls its checkout has pulled: the PC pushes
+    right after its first poll and then every 30 min, and the cloud pulls at
+    each of its syncs — plus once more just before a standby would lapse
+    (``loop``), so a live PC is never taken for gone between two syncs."""
+    try:
+        t_now = datetime.fromisoformat(now)
+    except (TypeError, ValueError):
+        return None
+    until = (t_now + timedelta(minutes=LOCAL_SKEW_TOL_MIN)).isoformat(timespec="seconds")
+    newest = store.last_poll(conn, "local")
+    if newest is not None and newest > until:
+        print(f"[standby] ignoring local poll(s) from the future ({newest}): PC clock ahead?")
+    last = store.last_poll(conn, "local", until=until, healthy=True)
+    if last is None:
+        return None
+    try:
+        age = (t_now - datetime.fromisoformat(last)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    left = LOCAL_FRESH_MIN * 60 - max(age, 0.0)
+    if left < 0:
+        return None
+    recent = store.last_polls(conn, "local", LOCAL_SICK_POLLS, until=until)
+    if len(recent) == LOCAL_SICK_POLLS and all(r["ok"] == 0 for r in recent):
+        print(f"[standby] off: the PC's last {LOCAL_SICK_POLLS} polls failed (blind, or "
+              f"its alerts undelivered; latest {recent[0]['ts']}): sending")
+        return None
+    return last, left
+
+
+class _Outbox:
+    """A poll's delivery tally for run_log.ok: senders take the indices to
+    record from ``delivered(report)``, which counts what the channels left
+    undelivered (an outage, a revoked key, a missing secret)."""
+
+    def __init__(self) -> None:
+        self.undelivered = 0
+
+    def delivered(self, report: dict) -> list[int]:
+        got = list(report.get("delivered", []))
+        self.undelivered += max(int(report.get("sent", 0)) - len(got), 0)
+        return got
+
+
 def poll(daily: bool = False, enable_new_low: bool = False,
          dry_run: bool = False, scan_promos: bool = True,
          max_tier: int = 2, scan_coupons: bool | None = None,
-         cdi: float | None = None, iteration: int = 0) -> dict:
+         cdi: float | None = None, iteration: int = 0,
+         role: str | None = None, hold: bool = False) -> dict:
     """One cycle. ``scan_promos`` is the DuckDuckGo deal scan; ``scan_coupons``
     the coupon/cashback sweep (defaults to ``scan_promos``, the old single
     switch). ``cdi`` lets the loop fetch the rate once instead of every poll;
     ``iteration`` (the loop's poll number) staggers ``every: N`` sources.
+    ``role`` (config.role() when None) goes to run_log.host; a 'cloud' poll
+    stands by while the PC watcher is active (``_local_watcher``): it fetches
+    and stores everything (observations, offer lines, promotion messages,
+    codes, cashback, run_log) but sends nothing and records no alerts_sent,
+    so the PC's next poll still announces whatever is news. ``hold`` does the
+    same for any role: the loop sets it while the PC watcher's DB couldn't be
+    synced (``loop``), so alerts are judged on a current DB, once.
+
+    run_log.ok records whether the poll could see and alert: some source
+    answered, no hard Amazon block, nothing left undelivered (a standby or
+    hold sends nothing, so it can't fail that part). The cloud stands by only
+    for healthy local polls.
 
     Result keys: polled, failures, partial, observations, stored, alerts,
     unseen_alerts (🔍), amazon_block ("hard": an Amazon source raised or its
@@ -82,16 +171,28 @@ def poll(daily: bool = False, enable_new_low: bool = False,
     a good product page is CI's steady state, not pushback), amazon_trouble
     (= a level is set; the loop backs off on it), requests, aod_ok/aod_tried
     and ingress_ok/ingress_tried (product pages whose offers line was read /
-    requested; logged per poll and at the start of run_log.detail).
+    requested; logged per poll and at the start of run_log.detail), role,
+    standby and standby_left_s (seconds until the local poll behind the
+    standby turns LOCAL_FRESH_MIN old; None without standby), held,
+    undelivered (alert items no channel took) and ok.
     """
     if scan_coupons is None:
         scan_coupons = scan_promos
+    role = config.role(role)
     conn = store.connect(config.DB_PATH)
     try:
         store.init_db(conn)
         if cdi is None:
             cdi = get_cdi_monthly()
         now = store.now_iso()
+        local = _local_watcher(conn, now) if role == "cloud" else None
+        standby = local is not None
+        if standby:
+            print(f"[standby] local watcher active (last poll {local[0]})")
+        elif hold:
+            print("[hold] the DB couldn't be synced yet: storing only, sending nothing")
+        quiet = standby or hold
+        outbox = _Outbox()
         today = datetime.fromisoformat(now).date()
         try:
             checks = coupon_checks.load_checks(today=today)
@@ -102,7 +203,9 @@ def poll(daily: bool = False, enable_new_low: bool = False,
 
         polled = failures = partial = stored = 0
         problems: list[str] = []   # run_log detail: failed + degraded sources
-        notes: list[str] = []      # run_log detail: record-only facts (offer counts up)
+        # run_log detail: record-only facts (standby/hold, offer counts up)
+        notes: list[str] = ([f"standby: local poll {local[0]}"] if standby
+                            else ["hold: DB not synced"] if hold else [])
         observations: list[Observation] = []
         summaries: list[OfferSummary] = []   # product pages' offers lines
         block: str | None = None   # Amazon pushback this poll ("hard" or None)
@@ -168,18 +271,22 @@ def poll(daily: bool = False, enable_new_low: bool = False,
                     print(f"[sold-out] {cfg['id']}: {', '.join(gone)}")
 
         alerts = triggers.evaluate(conn, observations, now, enable_new_low=enable_new_low)
-        _send_alerts(conn, alerts, now, dry_run)
+        _send_alerts(conn, alerts, now, dry_run, quiet, outbox)
         unseen = triggers.unseen_offers(conn, summaries, observations, now)
-        _send_unseen_alerts(conn, unseen, now, dry_run)
-        _offer_promo_alerts(conn, observations, now, dry_run)
+        _send_unseen_alerts(conn, unseen, now, dry_run, quiet, outbox)
+        _offer_promo_alerts(conn, observations, now, dry_run, quiet, outbox)
 
         # --- Phase 4b: promotions + coupons (best-effort; never break the poll) ---
         coupon_errors = 0
         if scan_promos:
-            _scan_promotions(conn, now, dry_run)
+            _scan_promotions(conn, now, dry_run, quiet, outbox)
         if scan_coupons:
-            coupon_errors = _scan_coupons(conn, now, dry_run, observations)
+            coupon_errors = _scan_coupons(conn, now, dry_run, observations, quiet, outbox)
 
+        # Could this poll see and alert? (run_log.ok; see the docstring)
+        ok = polled > failures and block != "hard" and outbox.undelivered == 0
+        if outbox.undelivered:
+            problems.append(f"undelivered: {outbox.undelivered} alert item(s)")
         requests_made = amazon_mod.PACER.count - req0
         stats = (f"aod_ok={aod_ok}/{aod_tried} req={requests_made} "
                  f"ingress={ingress_ok}/{ingress_tried}")
@@ -187,7 +294,7 @@ def poll(daily: bool = False, enable_new_low: bool = False,
               f"ingress={ingress_ok}/{ingress_tried}"
               + (f" backoff={block}" if block else ""), file=sys.stderr)
         store.insert_run_log(conn, now, polled, failures, partial, coupon_errors,
-                             " | ".join([stats] + notes + problems))
+                             " | ".join([stats] + notes + problems), host=role, ok=ok)
         conn.commit()
     finally:
         conn.close()   # uncommitted work (a crash mid-poll) is rolled back
@@ -197,7 +304,10 @@ def poll(daily: bool = False, enable_new_low: bool = False,
               "amazon_trouble": block is not None,
               "amazon_block": block, "requests": requests_made,
               "aod_ok": aod_ok, "aod_tried": aod_tried,
-              "ingress_ok": ingress_ok, "ingress_tried": ingress_tried}
+              "ingress_ok": ingress_ok, "ingress_tried": ingress_tried,
+              "role": role, "standby": standby,
+              "standby_left_s": round(local[1]) if standby else None,
+              "held": hold, "undelivered": outbox.undelivered, "ok": ok}
     print(f"[poll] {result}")
     return result
 
@@ -271,11 +381,17 @@ def _apply_validated_coupon(o: Observation, checks: list, codes: dict,
         o.pv = pv(o, cdi)
 
 
-def _send_alerts(conn, alerts: list, now: str, dry_run: bool) -> None:
+def _send_alerts(conn, alerts: list, now: str, dry_run: bool,
+                 standby: bool = False, outbox: _Outbox | None = None) -> None:
     """Send price/stock alerts. Dedup state records each alert's metric (the
     12x total for thresholds), and only for alerts whose batch a channel
     delivered, so an outage retries on the next poll instead of swallowing a
-    COMPRE (and a batch that did arrive isn't repeated)."""
+    COMPRE (and a batch that did arrive isn't repeated). On ``standby`` (the
+    PC watcher is active, or the loop holds sends) nothing is sent or
+    recorded. ``outbox`` tallies what went undelivered (run_log.ok)."""
+    if standby:
+        return
+    outbox = outbox or _Outbox()
     if alerts and dry_run:
         # Local testing: show what would fire, send nothing, don't touch dedup state.
         print(f"[dry-run] {len(alerts)} alert(s) would send (no messages sent):")
@@ -283,7 +399,7 @@ def _send_alerts(conn, alerts: list, now: str, dry_run: bool) -> None:
             print("  " + notify.format_alert(a).replace("\n", " | "))
     elif alerts:
         report = notify.notify(alerts)
-        for i in report.get("delivered", []):
+        for i in outbox.delivered(report):
             a = alerts[i]
             store.record_alert(conn, a.obs.listing_id, a.trigger, a.metric, now)
         print(f"[alerts] sent={report['sent']} wa_ok={report['wa_ok']} "
@@ -292,20 +408,22 @@ def _send_alerts(conn, alerts: list, now: str, dry_run: bool) -> None:
         print("[alerts] none")
 
 
-def _send_unseen_alerts(conn, alerts: list, now: str, dry_run: bool) -> None:
+def _send_unseen_alerts(conn, alerts: list, now: str, dry_run: bool,
+                        standby: bool = False, outbox: _Outbox | None = None) -> None:
     """Send 🔍 alerts (triggers.unseen_offers). Like ``_send_alerts``: the
     ladder state (alerts_sent under ``unseen:<ASIN>``, metric = card +
-    shipping) is written only for alerts a channel delivered, and a dry run
-    prints and writes nothing."""
-    if not alerts:
+    shipping) is written only for alerts a channel delivered, a dry run
+    prints and writes nothing, and a standby does neither."""
+    if not alerts or standby:
         return
+    outbox = outbox or _Outbox()
     if dry_run:
         print(f"[dry-run] {len(alerts)} unseen-offer alert(s) would send:")
         for a in alerts:
             print("  " + notify.format_unseen_offer(a).replace("\n", " | "))
         return
     report = notify.notify_unseen(alerts)
-    for i in report.get("delivered", []):
+    for i in outbox.delivered(report):
         a = alerts[i]
         store.record_alert(conn, a.key, a.trigger, a.metric, now)
     print(f"[unseen] sent={report['sent']} wa_ok={report['wa_ok']} "
@@ -353,15 +471,17 @@ def _promo_worth_it(o: Observation, message: str) -> bool:
             or total - _promo_amount(message, total) <= triggers.YEAR_LOW_12X)
 
 
-def _offer_promo_alerts(conn, observations: list, now: str, dry_run: bool) -> int:
+def _offer_promo_alerts(conn, observations: list, now: str, dry_run: bool,
+                        standby: bool = False, outbox: _Outbox | None = None) -> int:
     """Announce promotion messages Amazon starts showing on an eligible target
     offer (a coupon, a card deal...) near the user's range (``_promo_worth_it``).
     Every message is recorded in offer_promos (first/last seen); routine lines
     never alert. One alert per (ASIN, message) per poll, shown on its cheapest
     offer with the count of other sellers showing it; each seller's key goes to
     alerts_sent, written only after a delivery like the coupon pings, so an
-    outage can't swallow one. A dry run reads but writes nothing. Returns how
-    many blocks were (or would be) sent."""
+    outage can't swallow one. A dry run reads but writes nothing; a standby
+    records the messages but sends nothing (no terms lookups either: they are
+    Amazon requests). Returns how many blocks were (or would be) sent."""
     groups: dict[tuple[str, str], list[tuple[Observation, str]]] = {}
     for o in observations:
         if o.venue != "amazon" or not o.promos or not triggers.eligible(o):
@@ -380,6 +500,8 @@ def _offer_promo_alerts(conn, observations: list, now: str, dry_run: bool) -> in
                     conn, key, "offer_promo", within_hours=None, now=now):
                 continue
             group.append((o, key))
+    if standby:
+        return 0
     blocks, keys = [], []
     for (_asin, msg), members in groups.items():
         if not members:
@@ -399,7 +521,7 @@ def _offer_promo_alerts(conn, observations: list, now: str, dry_run: bool) -> in
             print("  " + b.replace("\n", " | "))
         return len(blocks)
     rep = notify.notify_offer_promos(blocks)
-    for i in rep.get("delivered", []):
+    for i in (outbox or _Outbox()).delivered(rep):
         for key in keys[i]:
             store.record_alert(conn, key, "offer_promo", None, now)
     print(f"[offer-promos] sent={rep['sent']} wa_ok={rep['wa_ok']} ntfy_ok={rep['ntfy_ok']}")
@@ -409,7 +531,8 @@ def _offer_promo_alerts(conn, observations: list, now: str, dry_run: bool) -> in
 PROMO_CAP = 10  # max promos verified/alerted per run
 
 
-def _scan_promotions(conn, now: str, dry_run: bool) -> None:
+def _scan_promotions(conn, now: str, dry_run: bool, standby: bool = False,
+                     outbox: _Outbox | None = None) -> None:
     try:
         promos = promos_mod.scan()
     except Exception as e:  # DDG hiccup must not sink the poll
@@ -419,6 +542,8 @@ def _scan_promotions(conn, now: str, dry_run: bool) -> None:
     for pr in promos:            # store ALL found promos for history
         pr.ts = now
         store.insert_promo(conn, pr, now)
+    if standby:                  # history only: the PC watcher announces
+        return
 
     ceiling = triggers.GOOD_12X  # only alert genuinely cheap promos
     candidates = []
@@ -446,7 +571,7 @@ def _scan_promotions(conn, now: str, dry_run: bool) -> None:
             print("  " + notify.format_promo(pr).replace("\n", " | "))
     elif fresh:
         rep = notify.notify_promos(fresh)
-        for i in rep.get("delivered", []):
+        for i in (outbox or _Outbox()).delivered(rep):
             store.record_alert(conn, fresh[i].url, "promo", fresh[i].price, now)
         print(f"[promos] sent={rep['sent']} wa_ok={rep['wa_ok']} ntfy_ok={rep['ntfy_ok']}")
     else:
@@ -489,7 +614,8 @@ def _corroborated(code: coupons_mod.CouponCode) -> bool:
     return bool(code.until) or "," in (code.source or "")
 
 
-def _scan_coupons(conn, now: str, dry_run: bool, observations: list) -> int:
+def _scan_coupons(conn, now: str, dry_run: bool, observations: list,
+                  standby: bool = False, outbox: _Outbox | None = None) -> int:
     """Amazon checkout codes + cashback portals (best-effort). Returns how many
     coupon/cashback sites failed, for the run log.
 
@@ -498,8 +624,9 @@ def _scan_coupons(conn, now: str, dry_run: bool, observations: list) -> int:
     the 12x total until a cart test lands in coupon_checks.yaml. A cashback
     portal pings when it turns on (first time, or again after being seen off) or
     raises its rate. Decisions come from alerts_sent, and nothing is marked
-    handled unless a channel delivered it, so a dry run or an outage can't
-    swallow the one alert this exists for.
+    handled unless a channel delivered it, so a dry run, a standby (codes and
+    rates are still stored) or an outage can't swallow the one alert this
+    exists for.
     """
     try:
         codes, errors = coupons_mod.scan_codes()
@@ -545,6 +672,8 @@ def _scan_coupons(conn, now: str, dry_run: bool, observations: list) -> int:
             sent.append((lid, "cashback", s.rate_pct))
         if not dry_run:
             store.insert_cashback(conn, s, now)
+    if standby:
+        blocks = []   # the PC watcher's sweep pings them; nothing recorded here
 
     print(f"[coupons] codes={len(codes)} new={new} "
           f"cashback={[(s.portal, s.rate_pct) for s in rates]} to_send={len(blocks)}")
@@ -554,7 +683,7 @@ def _scan_coupons(conn, now: str, dry_run: bool, observations: list) -> int:
             print("  " + b.replace("\n", " | "))
     elif blocks:
         rep = notify.notify_coupons(blocks)
-        for i in rep.get("delivered", []):   # undelivered -> retried next run
+        for i in (outbox or _Outbox()).delivered(rep):   # undelivered -> retried next run
             lid, trig, val = sent[i]
             store.record_alert(conn, lid, trig, val, now)
         print(f"[coupons] sent={rep['sent']} wa_ok={rep['wa_ok']} ntfy_ok={rep['ntfy_ok']}")
@@ -653,6 +782,8 @@ EXIT_SYNC_BUDGET_S = 180   # the budget exit syncs normally (retries) within thi
 MAX_BACKOFF_S = 1200       # pushback (dp blocked / a source raised) doubles the sleep up to 20 min
 JITTER = (0.8, 1.2)       # ±20% so polls don't land on a fixed beat
 MAX_ERRORS_IN_A_ROW = 5    # a poll that keeps crashing ends the run (visible in CI)
+RESUME_SLACK_S = 300       # a sleep overrunning its wait by more was a suspend (laptop lid)
+PULL_RETRY_S = (15, 30, 60, 120)   # the PC's first pull: Wi-Fi may still be connecting
 
 
 def _install_sigterm():
@@ -691,8 +822,10 @@ def _restore_signals(prev: dict) -> None:
 
 def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800,
          git_sync: bool = False, dry_run: bool = False, enable_new_low: bool = False,
+         role: str | None = None,
          *, poll_fn=None, sync_fn=None, pull_fn=None, cdi_fn=None,
-         clock=time.monotonic, sleep=time.sleep, uniform=random.uniform) -> dict:
+         clock=time.monotonic, sleep=time.sleep, uniform=random.uniform,
+         wall=time.time) -> dict:
     """Poll repeatedly until ``minutes`` would be exceeded.
 
     - sleep ``interval`` seconds ±20% between polls; when Amazon pushed back
@@ -706,44 +839,125 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
     - CDI is fetched once for the whole loop; each poll gets its iteration
       number so ``every: N`` sources are staggered;
     - with ``git_sync``: pull before the first poll (the previous watcher's
-      final snapshot landed after this job was queued), commit + push the DB
-      every SYNC_EVERY_S (a failed sync is logged, never fatal), and once more
-      on the way out with both stop signals ignored: the normal retrying sync
-      within EXIT_SYNC_BUDGET_S when the time budget ran out (no kill is
-      coming), a single fast attempt after SIGINT/SIGTERM or a crash.
+      final snapshot landed after this job was queued); commit + push the DB
+      before the first poll that finds the last sync SYNC_EVERY_S old, so that
+      poll judges dedup on what the other watcher pushed meanwhile (a failed
+      sync is logged, never fatal); and once more on the way out with both
+      stop signals ignored: the normal retrying sync within
+      EXIT_SYNC_BUDGET_S when the time budget ran out (no kill is coming), a
+      single fast attempt after SIGINT/SIGTERM or a crash;
+    - time runs on two clocks, ``clock`` (monotonic) and ``wall``: a laptop
+      suspended inside ``sleep`` wakes with its wall clock hours ahead,
+      whether or not the monotonic clock counted the suspend, and its DB as
+      old as the suspend. A sleep that overran its wait by RESUME_SLACK_S is
+      a resume, synced before the next poll (the cloud may have alerted
+      meanwhile); the 30-min sync and the time budget go by whichever clock
+      ran further, so a run that slept past its budget stops without polling;
+    - ``role`` (config.role() when None) goes to every poll. With git sync,
+      the PC watcher (local) also syncs right after its first poll and after
+      its first poll since a resume, so the cloud learns it is up at its next
+      sync instead of ~30 min later; and a cloud loop whose standby is about
+      to lapse (the poll's ``standby_left_s``) syncs before the next poll, so
+      it judges the PC on what the PC last pushed, not on a checkout up to 30
+      min old (two independent 30-min sync cycles alone would have it judge
+      local polls up to ~1h old, dropping a live PC's standby for part of
+      most cycles);
+    - the PC watcher never alerts on a DB it couldn't bring up to date: its
+      first pull is retried (PULL_RETRY_S: Wi-Fi may connect after log on),
+      and while that pull, or the sync after a resume, failed, its polls run
+      with ``hold`` (store only), each preceded by another sync, until one
+      works.
 
     The keyword-only hooks exist for tests.
     """
     poll_fn = poll_fn or poll
     sync_fn = sync_fn or gitsync.sync_db
     pull_fn = pull_fn or gitsync.pull_latest
+    role = config.role(role)
+    local = role == "local"
     cdi = (cdi_fn or get_cdi_monthly)()
+    held = False   # the PC's DB isn't known to be current: its polls store only
     if git_sync:
-        pull_fn()
-    start = clock()
-    deadline = start + minutes * 60
+        pulled = pull_fn()
+        if local:
+            for pause in PULL_RETRY_S:
+                if pulled:
+                    break
+                print(f"[loop] pull before the first poll failed: retrying in {pause:.0f}s")
+                sleep(pause)
+                pulled = pull_fn()
+            held = not pulled
+            if held:
+                print("[loop] no pull: polling store-only (no alerts) until a sync works")
+    start, wall_start = clock(), wall()
+    budget = minutes * 60
     last_coupons: float | None = None
-    last_sync = start
+    last_sync, last_sync_wall = start, wall_start
+    refresh_at: float | None = None   # loop clock: the cloud's standby lapses
+    slept_from, planned = wall_start, 0.0   # the last sleep: wall() at its start, its wait
     base = interval
     polls = syncs = errors_in_row = 0
     cap = max(MAX_BACKOFF_S, interval)
     budget_exit = False
 
+    def elapsed() -> float:
+        return max(clock() - start, wall() - wall_start)
+
+    def periodic_sync() -> bool:
+        nonlocal syncs, last_sync, last_sync_wall, refresh_at, held
+        synced = False
+        try:
+            synced = bool(sync_fn())
+            syncs += 1
+        except Exception:   # a sync problem must never stop the watcher
+            traceback.print_exc()
+        last_sync, last_sync_wall = clock(), wall()
+        refresh_at = None   # the next poll judges the standby on the synced DB
+        if held and synced:
+            print("[loop] DB synced: alerts on again")
+        held = held and not synced
+        return synced
+
     old_handler = _install_sigterm()
     try:
         while True:
+            resumed = False
+            if polls:   # back from sleep(wait)
+                asleep = wall() - slept_from
+                resumed = asleep - planned > RESUME_SLACK_S
+                if resumed:
+                    print(f"[loop] resumed after {asleep:.0f}s asleep ({planned:.0f}s planned)")
+                if elapsed() >= budget:
+                    print(f"[loop] {polls} poll(s); time budget spent while asleep, stopping")
+                    budget_exit = True
+                    break
+                stale = (clock() - last_sync >= SYNC_EVERY_S
+                         or wall() - last_sync_wall >= SYNC_EVERY_S)
+                lapsing = refresh_at is not None and clock() >= refresh_at
+                if git_sync and (resumed or held or stale or lapsing):
+                    why = ("resumed" if resumed else "held" if held
+                           else "30-min sync" if stale
+                           else "standby lapsing: to see the PC's latest polls")
+                    print(f"[loop] syncing before the poll ({why})")
+                    if not periodic_sync() and local and resumed:
+                        held = True
+                        print("[loop] no sync after the resume: polling store-only "
+                              "(no alerts) until one works")
             t0 = clock()
             do_coupons = last_coupons is None or t0 - last_coupons >= coupon_every
             try:
                 result = poll_fn(dry_run=dry_run, enable_new_low=enable_new_low,
                                  scan_promos=False, scan_coupons=do_coupons, cdi=cdi,
-                                 iteration=polls)
+                                 iteration=polls, role=role, hold=held)
                 level = result.get("amazon_block") or (
                     "hard" if result.get("amazon_trouble") else None)
+                left = result.get("standby_left_s")
+                refresh_at = None if left is None else t0 + left
                 errors_in_row = 0
             except Exception:
                 traceback.print_exc()
                 level = "hard"
+                refresh_at = None
                 errors_in_row += 1
                 if errors_in_row >= MAX_ERRORS_IN_A_ROW:
                     raise
@@ -754,23 +968,19 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
 
             trouble = level is not None
             base = min(base * 2, cap) if trouble else interval
-            if git_sync and clock() - last_sync >= SYNC_EVERY_S:
-                try:
-                    sync_fn()
-                    syncs += 1
-                except Exception:   # a sync problem must never stop the watcher
-                    traceback.print_exc()
-                last_sync = clock()
+            if git_sync and local and (polls == 1 or resumed):
+                periodic_sync()   # announce: the cloud stands by from its next sync
 
             wait = base * uniform(*JITTER)
             if trouble:
                 wait = min(wait, cap)
-            if clock() + wait + took > deadline:
+            if elapsed() + wait + took > budget:
                 print(f"[loop] {polls} poll(s); time budget reached, stopping")
                 budget_exit = True
                 break
             print(f"[loop] poll {polls} took {took:.0f}s; next in {wait:.0f}s"
                   + (f" (backing off: {level})" if trouble else ""))
+            slept_from, planned = wall(), wait
             sleep(wait)
     finally:
         if git_sync:
@@ -788,6 +998,55 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
         if old_handler is not None:
             signal.signal(signal.SIGTERM, old_handler[0] or signal.SIG_DFL)
     return {"polls": polls, "syncs": syncs}
+
+
+# --- one watcher loop per DB ---------------------------------------------------
+
+def watcher_lock_path() -> Path:
+    """The lock a ``--loop`` holds: next to the DB it polls into and syncs
+    (data/prices.db.lock in a clone; gitignored)."""
+    return Path(f"{config.DB_PATH}.lock")
+
+
+def acquire_lock(path: Path):
+    """Take a non-blocking exclusive lock on ``path`` for the life of this
+    process: the open file to keep (and ``release_lock``), or None when
+    another process holds it. Two loops in one clone would run git and
+    rewrite the DB under each other (a PC watcher outliving a Task Scheduler
+    stop of its wrapper, a manual run next to the task). The OS drops the
+    lock when the process dies, so a killed run never leaves a stale one."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")
+    except OSError as e:
+        print(f"[loop] can't open the lock {path} ({e}): running unlocked", file=sys.stderr)
+        return False   # not None: go on, with nothing to release
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def release_lock(lock) -> None:
+    if not lock:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    finally:
+        lock.close()   # closing drops a flock too
 
 
 def main(argv=None) -> int:
@@ -821,6 +1080,10 @@ def main(argv=None) -> int:
                    help="loop: minimum seconds between coupon/cashback sweeps")
     p.add_argument("--git-sync", action="store_true",
                    help="loop: commit + push data/prices.db every 30 min and on exit")
+    p.add_argument("--role", choices=config.ROLES, default=None,
+                   help="which watcher this is: cloud (GitHub Actions; stands by "
+                        "while the PC polls) or local (the PC watcher); "
+                        "default: S25_ROLE, else cloud")
     args = p.parse_args(argv)
 
     if args.init_db:
@@ -840,17 +1103,36 @@ def main(argv=None) -> int:
         print(f"[heartbeat] wa_ok={r['wa_ok']} ntfy_ok={r['ntfy_ok']} :: {r['message']}")
         return 0 if (r["wa_ok"] or r["ntfy_ok"]) else 1   # a silent heartbeat fails the job
 
+    try:
+        role = config.role(args.role)
+    except ValueError as e:   # a bad S25_ROLE: refuse to poll rather than guess
+        p.error(str(e))
+
+    if role == "local" and not args.dry_run and not notify.channels():
+        # its polls would put the cloud on standby for a watcher that can't alert
+        print("[local] no alert channel configured (CALLMEBOT_PHONE + CALLMEBOT_APIKEY, "
+              "or NTFY_TOPIC, in .env): the PC watcher refuses to run", file=sys.stderr)
+        return 2
+
     if args.loop:
-        r = loop(minutes=args.minutes, interval=args.interval,
-                 coupon_every=args.coupon_every, git_sync=args.git_sync,
-                 dry_run=args.dry_run, enable_new_low=args.enable_new_low)
+        path = watcher_lock_path()
+        lock = acquire_lock(path)
+        if lock is None:
+            print(f"[loop] another watcher holds {path}: exiting")
+            return 0
+        try:
+            r = loop(minutes=args.minutes, interval=args.interval,
+                     coupon_every=args.coupon_every, git_sync=args.git_sync,
+                     dry_run=args.dry_run, enable_new_low=args.enable_new_low, role=role)
+        finally:
+            release_lock(lock)
         print(f"[loop] done: {r}")
         return 0
 
     # default action
     poll(daily=args.daily, enable_new_low=args.enable_new_low,
          dry_run=args.dry_run, scan_promos=not args.no_promos,
-         max_tier=1 if args.tier1 else 2)
+         max_tier=1 if args.tier1 else 2, role=role)
     return 0
 
 

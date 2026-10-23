@@ -40,6 +40,24 @@ def get(name: str, default: str | None = None, required: bool = False) -> str | 
     return value
 
 
+# Which watcher this process is: 'cloud' (the GitHub Actions loop, default) or
+# 'local' (the PC watcher, scripts/local_watcher.ps1). Every poll writes it to
+# run_log.host; a cloud poll stands by while a local one is active (run.py).
+ROLES = ("cloud", "local")
+
+
+def role(value: str | None = None) -> str:
+    """The watcher role: ``value`` (the --role flag) if given, else S25_ROLE,
+    else 'cloud'. Raises ValueError on anything but ROLES: a typo must not
+    make the PC watcher log itself as 'cloud' (the cloud one would never
+    stand by for it, and both would alert)."""
+    raw = value or get("S25_ROLE") or "cloud"
+    r = raw.strip().lower()
+    if r not in ROLES:
+        raise ValueError(f"S25_ROLE / --role must be one of {', '.join(ROLES)}, not {raw!r}")
+    return r
+
+
 # Default DB location: data/prices.db committed to the repo (spec §5).
 DB_PATH = Path(os.environ.get("S25_DB_PATH", _REPO_ROOT / "data" / "prices.db"))
 REGISTRY_PATH = _REPO_ROOT / "src" / "registry.yaml"

@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import timedelta
 
 import pytest
 
@@ -176,6 +177,43 @@ def test_restock_fires_on_flip(conn):
     store.insert_observation(conn, prev)
     alerts = triggers.evaluate(conn, [_obs(4200.0)], NOW)
     assert "restock" in {a.trigger for a in alerts}
+
+
+def test_restock_stored_by_a_poll_that_could_not_announce_it(conn):
+    # sold out at 11:00; at 11:30 a poll that sends nothing (the cloud on
+    # standby, or the other watcher's row merged in) stored it back in stock
+    store.insert_observation(conn, _obs(4200.0, in_stock=False, ts="2026-08-22T11:00:00+00:00"))
+    store.insert_observation(conn, _obs(4200.0, ts="2026-08-22T11:30:00+00:00"))
+    (a,) = triggers.evaluate(conn, [_obs(4200.0)], NOW)        # the edge is long gone
+    assert (a.trigger, a.note) == ("restock", "voltou ao estoque")
+    assert triggers.evaluate(conn, [_obs(4200.0)], NOW)        # undelivered: retried
+    store.record_alert(conn, "L1", a.trigger, a.metric, NOW)
+    later = "2026-08-22T12:04:00+00:00"
+    assert triggers.evaluate(conn, [_obs(4200.0, ts=later)], later) == []
+
+
+def test_restock_only_within_the_window_of_the_return(conn):
+    # back since 09:30 at 4.500 (no ping: above 4.300), drifting to 4.200 at
+    # noon is no "voltou ao estoque"
+    store.insert_observation(conn, _obs(4500.0, in_stock=False, ts="2026-08-22T09:00:00+00:00"))
+    store.insert_observation(conn, _obs(4500.0, ts="2026-08-22T09:30:00+00:00"))
+    assert triggers.evaluate(conn, [_obs(4200.0)], NOW) == []
+    assert triggers.RESTOCK_WINDOW >= timedelta(minutes=45 + 30)   # standby + a sync
+    store.insert_observation(conn, _obs(4500.0, listing_id="L2", in_stock=False,
+                                        ts="2026-08-22T10:00:00+00:00"))
+    store.insert_observation(conn, _obs(4500.0, listing_id="L2", ts="2026-08-22T10:01:00+00:00"))
+    assert [a.trigger for a in triggers.evaluate(conn, [_obs(4200.0, listing_id="L2")],
+                                                 NOW)] == ["restock"]
+
+
+def test_a_threshold_alert_noted_as_restock_counts_as_the_restock(conn):
+    store.insert_observation(conn, _obs(3450.0, in_stock=False, ts="2026-08-22T11:00:00+00:00"))
+    (a,) = triggers.evaluate(conn, [_obs(3450.0)], NOW)
+    assert (a.trigger, a.note) == ("instant_buy", "voltou ao estoque")
+    store.record_alert(conn, "L1", a.trigger, a.metric, NOW)
+    later = "2026-08-22T12:30:00+00:00"
+    # a rise into the 🟢 band doesn't say "voltou ao estoque" a second time
+    assert triggers.evaluate(conn, [_obs(4200.0, ts=later)], later) == []
 
 
 def test_venue_spread_across_venues(conn):
@@ -424,6 +462,41 @@ def test_unseen_counts_an_offer_rotated_out_of_the_buybox_as_known(conn):
     # a cheaper one behind it is still hidden: the known 3.900 doesn't mask it
     (a,) = triggers.unseen_offers(conn, [_line(3840.0, ts=_t(8))], [cell], _t(8))
     assert (a.level, a.attributed, a.attributed_min) == ("year_low", 2, 3900.0)
+
+
+def test_unseen_counts_offers_announced_by_name(conn):
+    # the PC's panel named Loja X at 3.450 and sent 🔴; three hours later the
+    # cloud has only the line (the stored row is too old to vouch for it)
+    store.insert_observation(conn, _named(3450.0, seller="LOJAX", ts=_t(0)))
+    store.record_alert(conn, f"{ASIN}:LOJAX:excelente", "instant_buy", 3450.0, _t(0))
+    assert triggers.unseen_offers(conn, [_line(3450.0, ts=_t(180))], [], _t(180)) == []
+    # the same offer with its shipping, or cents off the rebuilt plan
+    assert triggers.unseen_offers(conn, [_line(3449.70, 13.22, ts=_t(180))], [], _t(180)) == []
+    (a,) = triggers.unseen_offers(conn, [_line(3399.0, ts=_t(180))], [], _t(180))
+    assert a.metric == 3399.0                                # R$ 51 cheaper: news
+
+
+def test_unseen_named_rungs_follow_the_ladder(conn):
+    store.record_alert(conn, f"{ASIN}:LOJAX:excelente", "year_low", 3900.0, _t(0))
+    assert triggers.unseen_offers(conn, [_line(3900.0, ts=_t(180))], [], _t(180)) == []
+    (a,) = triggers.unseen_offers(conn, [_line(3790.0, ts=_t(180))], [], _t(180))
+    assert a.level == "aggressive"                           # a stronger level fires
+    # another ASIN's named alerts are no rungs here
+    store.record_alert(conn, "B0FTMQQ7L2:LOJAY:excelente", "instant_buy", 3400.0, _t(0))
+    assert len(triggers.unseen_offers(conn, [_line(3790.0, ts=_t(180))], [], _t(180))) == 1
+
+
+def test_unseen_named_rung_ends_with_a_sell_out_or_a_departure(conn):
+    store.record_alert(conn, f"{ASIN}:LOJAX:excelente", "year_low", 3900.0, _t(0))
+    # the PC's complete panel stored Loja X sold out since: the line's 3.900
+    # is someone else
+    store.insert_observation(conn, _named(3900.0, seller="LOJAX", in_stock=False, ts=_t(60)))
+    assert len(triggers.unseen_offers(conn, [_line(3900.0, ts=_t(180))], [], _t(180))) == 1
+    conn.execute("DELETE FROM observations")
+    assert triggers.unseen_offers(conn, [_line(3900.0, ts=_t(180))], [], _t(180)) == []
+    # a reading since showed the offer leave (the line vanished): fresh start
+    store.insert_offer_summary(conn, _no_line(_t(90)))
+    assert len(triggers.unseen_offers(conn, [_line(3900.0, ts=_t(180))], [], _t(180))) == 1
 
 
 def test_unseen_ladder_only_counts_delivered_alerts(conn):

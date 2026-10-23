@@ -101,7 +101,9 @@ def test_git_sync_every_30_min_and_on_exit():
     clock = Clock()
     poll_fn, _ = _poller(clock)
     r, syncs, _ = _loop(clock, poll_fn, git_sync=True)
-    assert syncs == [2010, 3510]                   # first poll past 1800 s, then exit
+    # before the first poll due 1800 s after the last sync (it judges dedup on
+    # what the other watcher pushed meanwhile), then the exit sync
+    assert syncs == [2000, 3510]
     assert r["syncs"] == 2
 
 
@@ -166,7 +168,8 @@ def test_cli_loop_flags(monkeypatch):
     assert run.main(["--loop", "--minutes", "2", "--interval", "30",
                      "--coupon-every", "600"]) == 0
     assert got == {"minutes": 2.0, "interval": 30.0, "coupon_every": 600.0,
-                   "git_sync": False, "dry_run": False, "enable_new_low": False}
+                   "git_sync": False, "dry_run": False, "enable_new_low": False,
+                   "role": "cloud"}
     run.main(["--loop", "--git-sync"])
     assert got["git_sync"] is True and got["minutes"] == 345 and got["interval"] == 240
 

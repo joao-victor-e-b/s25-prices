@@ -155,6 +155,17 @@ def _deliver(blocks: list[str], title: str) -> dict:
             "delivered": delivered}
 
 
+def channels() -> list[str]:
+    """The channels whose secrets are set (environment or .env): 'whatsapp'
+    (CALLMEBOT_PHONE + CALLMEBOT_APIKEY) and/or 'ntfy' (NTFY_TOPIC)."""
+    out = []
+    if config.get("CALLMEBOT_PHONE") and config.get("CALLMEBOT_APIKEY"):
+        out.append("whatsapp")
+    if config.get("NTFY_TOPIC"):
+        out.append("ntfy")
+    return out
+
+
 def send_whatsapp(message: str) -> bool:
     params = {
         "phone": config.get("CALLMEBOT_PHONE", required=True),
@@ -241,8 +252,9 @@ def format_heartbeat(best, code_hint: list[tuple[str, float]] | tuple[str, float
     (``offers``: (label, offers_total, min_card_price) per listing, from
     offer_summary — how many offers exist beyond the ones the server can
     name), one unvalidated code worth trying, and the last 24h of
-    polls/failures (``totals`` is a ``store.run_log_totals`` row or a dict
-    with the same keys)."""
+    polls/failures and which watchers ran them (``totals`` is a
+    ``store.run_log_totals`` row or a dict with the same keys; see
+    ``_hosts``)."""
     if best is None:
         lines = ["📊 S25 Amazon — sem oferta Excelente+ em estoque (48h)"]
     else:
@@ -265,10 +277,23 @@ def format_heartbeat(best, code_hint: list[tuple[str, float]] | tuple[str, float
                 if len(hints) > 1 else "")
         lines.append(f"🎟️ testar {safe_text(code)}: até −{money(value)}{more} (não validado)")
     warn = "⚠️ " if (totals["failures"] or totals["partial"]) else ""
-    lines.append(f"{warn}24h: {totals['runs']} polls · {totals['failures']} falhas · "
+    lines.append(f"{warn}24h: {totals['runs']} polls{_hosts(totals)} · "
+                 f"{totals['failures']} falhas · "
                  f"{totals['partial']} parciais · {totals['coupon_errors']} erros cupom"
                  f" · {sources} fontes")
     return "\n".join(lines)
+
+
+def _hosts(totals) -> str:
+    """Which watchers polled in the 24h (run_log.host counts from
+    ``store.run_log_totals``): ' (PC ativo 120, nuvem 360)' when the PC
+    watcher polled, ' (só nuvem)' when only the cloud did; '' without polls
+    or without the per-host counts."""
+    if "local_runs" not in totals.keys() or not totals["runs"]:
+        return ""
+    if not totals["local_runs"]:
+        return " (só nuvem)"
+    return f" (PC ativo {totals['local_runs']}, nuvem {totals['cloud_runs']})"
 
 
 def send_heartbeat(message: str) -> dict:

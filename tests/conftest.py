@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src import coupon_checks
+from src import config, coupon_checks
 from src.sources import amazon
 
 
@@ -29,6 +29,29 @@ def _fresh_amazon_state(monkeypatch):
     monkeypatch.setattr(amazon, "PACER", amazon.Pacer(gap=0, sleep=lambda s: None))
     yield
     amazon.reset_state()
+
+
+@pytest.fixture(autouse=True)
+def _default_role(monkeypatch):
+    """Every test runs as the cloud watcher unless it says otherwise: neither
+    the shell's nor .env's S25_ROLE leaks in (an empty value reads as cloud,
+    and load_env never overrides a variable that is set)."""
+    monkeypatch.setenv("S25_ROLE", "")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_channels(monkeypatch):
+    """No test can reach CallMeBot or ntfy with the real secrets from .env:
+    they read empty (tests that need a configured channel set dummies)."""
+    for name in ("CALLMEBOT_PHONE", "CALLMEBOT_APIKEY", "NTFY_TOPIC"):
+        monkeypatch.setenv(name, "")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path, monkeypatch):
+    """The default DB (and the loop's lock next to it) live in the test's
+    tmp dir, never data/prices.db."""
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "prices.db")
 
 
 @pytest.fixture

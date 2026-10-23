@@ -129,20 +129,28 @@ CREATE TABLE IF NOT EXISTS offer_summary (
 );
 
 -- One row per poll so the heartbeat can report real failure counts
--- (stderr in the Actions log is invisible day to day).
+-- (stderr in the Actions log is invisible day to day). host is the watcher
+-- that polled (config.role: cloud | local; NULL = before Oct 2026, cloud):
+-- a cloud poll stands by while a healthy local row is fresh
+-- (run._local_watcher). ok = the poll could see and alert: some source
+-- answered, Amazon didn't block it hard, every send was delivered (NULL =
+-- before the column, counted healthy).
 CREATE TABLE IF NOT EXISTS run_log (
   ts             TIMESTAMP PRIMARY KEY,
   polled         INTEGER,
   failures       INTEGER,      -- sources whose fetch raised
   partial        INTEGER,      -- sources that degraded (e.g. Amazon AOD blocked)
   coupon_errors  INTEGER,      -- coupon/cashback sites that failed
-  detail         TEXT
+  detail         TEXT,
+  host           TEXT,
+  ok             INTEGER
 );
 """
 
 # Columns added after the committed DB was created: {table: {column: decl}}.
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "observations": {"coupon_code": "TEXT"},
+    "run_log": {"host": "TEXT", "ok": "INTEGER"},
 }
 
 # A listing re-stores an unchanged snapshot only after this long (see module doc).
@@ -437,6 +445,30 @@ def last_out_of_stock(conn: sqlite3.Connection, listing_id: str, now: str) -> st
     return row[0] if row else None
 
 
+def first_in_stock_after(conn: sqlite3.Connection, listing_id: str, since: str,
+                         now: str) -> str | None:
+    """ts of the listing's first in-stock row after ``since`` (its last
+    sell-out) and up to ``now``: when it came back. None = not stored yet."""
+    row = conn.execute(
+        "SELECT MIN(ts) FROM observations WHERE listing_id=? AND in_stock=1 "
+        "AND ts > ? AND ts <= ?",
+        (listing_id, since, now),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def alerted_since(conn: sqlite3.Connection, listing_id: str, triggers: tuple,
+                  since: str, now: str) -> bool:
+    """Was an alert with one of ``triggers`` recorded (delivered) for the
+    listing after ``since`` and up to ``now``?"""
+    marks = ",".join("?" * len(triggers))
+    return conn.execute(
+        f"SELECT 1 FROM alerts_sent WHERE listing_id=? AND trigger IN ({marks}) "
+        "AND ts > ? AND ts <= ? LIMIT 1",
+        (listing_id, *triggers, since, now),
+    ).fetchone() is not None
+
+
 def threshold_alerts(conn: sqlite3.Connection, listing_id: str, triggers: tuple,
                      since: str | None, now: str) -> list[tuple[str, float | None]]:
     """(trigger, metric) of the price-threshold alerts sent for a listing after
@@ -505,13 +537,17 @@ def _merge_upserted(conn: sqlite3.Connection, table: str, key: tuple[str, ...],
 
 def merge_db_rows(src_path: Path, dst_path: Path) -> dict[str, int]:
     """Copy the rows of the DB at ``src_path`` into ``dst_path``. Used by
-    gitsync when two watchers' snapshots of the binary DB conflict, so the
-    result loses nothing either side saw: append-only tables (observations,
-    alerts_sent, run_log, offer_summary, ...) take the rows ``dst`` lacks
-    (INSERT OR IGNORE on the primary key); upserted tables (``_UPSERTED``) keep
-    the newer state of a row both have. Columns are those both DBs share; a
-    table only one side has yet is created by ``init_db`` (dst) or simply has
-    nothing to copy (src). Returns rows added or updated per table."""
+    gitsync when two watchers' snapshots of the binary DB conflict (with the
+    PC watcher running next to the cloud one, most syncs), so the result
+    loses nothing either side saw: append-only tables (observations,
+    alerts_sent, run_log — host and ok included —, offer_summary, ...) take
+    the rows ``dst`` lacks (INSERT OR IGNORE on the primary key); upserted
+    tables (``_UPSERTED``) keep the newer state of a row both have. Columns
+    are those both DBs share (``init_db`` first brings dst up to this code's
+    schema, so a column an older dst lacks, like run_log.host, is carried
+    too); a table only one side has yet is created by ``init_db`` (dst) or
+    simply has nothing to copy (src). Returns rows added or updated per
+    table."""
     conn = connect(Path(dst_path))
     try:
         init_db(conn)
@@ -541,21 +577,51 @@ def merge_db_rows(src_path: Path, dst_path: Path) -> dict[str, int]:
 
 
 def insert_run_log(conn: sqlite3.Connection, ts: str, polled: int, failures: int,
-                   partial: int, coupon_errors: int, detail: str = "") -> None:
+                   partial: int, coupon_errors: int, detail: str = "",
+                   host: str | None = None, ok: bool = True) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO run_log (ts, polled, failures, partial, "
-        "coupon_errors, detail) VALUES (?, ?, ?, ?, ?, ?)",
-        (ts, polled, failures, partial, coupon_errors, detail),
+        "coupon_errors, detail, host, ok) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts, polled, failures, partial, coupon_errors, detail, host, int(bool(ok))),
     )
 
 
+def last_poll(conn: sqlite3.Connection, host: str, until: str | None = None,
+              healthy: bool = False) -> str | None:
+    """ts of the latest poll ``host`` logged (run_log), or None: only those
+    at or before ``until`` when given (a row stamped later by a clock running
+    ahead must not hide the correct ones), and with ``healthy`` only polls
+    whose ok is 1 or NULL (logged before the column)."""
+    row = conn.execute(
+        "SELECT MAX(ts) FROM run_log WHERE host=? AND (? IS NULL OR ts <= ?) "
+        "AND (? = 0 OR ok IS NULL OR ok <> 0)",
+        (host, until, until, int(healthy)),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def last_polls(conn: sqlite3.Connection, host: str, n: int,
+               until: str | None = None) -> list[sqlite3.Row]:
+    """The ``n`` latest polls ``host`` logged (ts, ok), newest first; only
+    those at or before ``until`` when given."""
+    return conn.execute(
+        "SELECT ts, ok FROM run_log WHERE host=? AND (? IS NULL OR ts <= ?) "
+        "ORDER BY ts DESC LIMIT ?",
+        (host, until, until, n),
+    ).fetchall()
+
+
 def run_log_totals(conn: sqlite3.Connection, now: str, hours: int = 24) -> sqlite3.Row:
-    """Summed failure counters over the last ``hours`` (for the heartbeat)."""
+    """Summed failure counters over the last ``hours`` (for the heartbeat),
+    plus polls per watcher: ``local_runs`` (the PC) and ``cloud_runs`` (the
+    rest — rows from before the host column count as cloud)."""
     cutoff = (datetime.fromisoformat(now) - timedelta(hours=hours)).isoformat()
     return conn.execute(
         "SELECT COUNT(*) AS runs, COALESCE(SUM(failures), 0) AS failures, "
         "COALESCE(SUM(partial), 0) AS partial, "
-        "COALESCE(SUM(coupon_errors), 0) AS coupon_errors "
+        "COALESCE(SUM(coupon_errors), 0) AS coupon_errors, "
+        "COALESCE(SUM(host = 'local'), 0) AS local_runs, "
+        "COALESCE(SUM(host IS NULL OR host <> 'local'), 0) AS cloud_runs "
         "FROM run_log WHERE ts >= ? AND ts <= ?",
         (cutoff, now),
     ).fetchone()
@@ -589,17 +655,6 @@ def last_alert(conn: sqlite3.Connection, listing_id: str, trigger: str,
             "AND ts >= ? ORDER BY ts DESC LIMIT 1",
             (listing_id, trigger, cutoff),
         )
-    return cur.fetchone()
-
-
-def last_observation(conn: sqlite3.Connection, source_id: str,
-                     listing_id: str, before_ts: str) -> sqlite3.Row | None:
-    """The prior observation for a listing (for restock detection)."""
-    cur = conn.execute(
-        "SELECT * FROM observations WHERE source_id=? AND listing_id=? "
-        "AND ts < ? ORDER BY ts DESC LIMIT 1",
-        (source_id, listing_id, before_ts),
-    )
     return cur.fetchone()
 
 
