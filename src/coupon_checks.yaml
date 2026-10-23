@@ -27,5 +27,17 @@ checks:
   - {code: GROWTH, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
   - {code: MEUPRIMEDAY, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
   - {code: NET10, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
-  # Not concluded (rate limit hit mid-test): DIADECUPONS, AGOSTOCHEGOU, ALOCUPOM,
-  # CUPOM10, HORAPRIME, TIMEBR, SOMOSAMAZON, MEUCARTAOAMZ.
+  # Rate limit hit mid-test; DIADECUPONS, AGOSTOCHEGOU, ALOCUPOM, CUPOM10,
+  # HORAPRIME, TIMEBR, SOMOSAMAZON, MEUCARTAOAMZ were tested in the afternoon:
+  # 2026-10-23 (afternoon) — same setup: logged-in Prime account, cart = only
+  # B0FTMWWS8Y 512GB Excelente from Assurant Ecophone at R$ 4.275,78. The
+  # 150FFCARTAO control returned its own message, so the answers were fresh.
+  - {code: DIADECUPONS, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: AGOSTOCHEGOU, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: ALOCUPOM, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: CUPOM10, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: HORAPRIME, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: TIMEBR, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: SOMOSAMAZON, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: MEUCARTAOAMZ, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: 150FFCARTAO, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido não pode ser aplicado à esta compra."}
