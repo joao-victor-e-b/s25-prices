@@ -20,3 +20,6 @@ Thumbs.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+
+# Claude Code local state
+.claude/scheduled_tasks.lock
