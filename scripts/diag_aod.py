@@ -57,35 +57,34 @@ def session(ua):
     return s
 
 
+import re
+
+
+def smid_probe(s, asin, smid, label):
+    r = s.get(f"{HOST}/dp/{asin}?smid={smid}&psc=1", headers={**NAV, **HINTS}, timeout=30)
+    t = r.text
+    mids = re.findall(r'name="merchantID"[^>]*value="([A-Z0-9]+)"|id="merchantID"[^>]*value="([A-Z0-9]+)"', t)
+    mids = sorted({a or b for a, b in mids})
+    ingress = re.search(r'id="aod-ingress-link".{0,600}', t, re.S)
+    ing = re.sub(r"<[^>]+>", " ", ingress.group(0)) if ingress else ""
+    ing = re.sub(r"\s+", " ", ing)[:200]
+    parc = re.findall(r"total parcelado\s*R\$\s*([\d.]+,\d{2})", t)
+    acc = len(re.findall(r'id="newAccordionRow_\d+"', t))
+    print(f"{label:34} HTTP {r.status_code} merchantIDs={mids} accordion_rows={acc} "
+          f"parcelado={parc[:3]} ingress='{ing}'", flush=True)
+
+
 def run():
-    for asin in ASINS:
-        print(f"== {asin}", flush=True)
-        # v1: today's shape (old UA, warmed by a dp GET)
-        s = session(UA_125)
-        show("v1 dp warm (UA125)", s.get(f"{HOST}/dp/{asin}", headers=NAV, timeout=30)); gap()
-        show("v1 aod (UA125, warmed)", s.get(AOD.format(a=asin), headers=xhr(asin), timeout=30)); gap()
-        # v2: consistent Chrome 141 + client hints + fetch metadata, warmed
-        s = session(UA_141)
-        show("v2 dp warm (141+hints)", s.get(f"{HOST}/dp/{asin}", headers={**NAV, **HINTS}, timeout=30)); gap()
-        meta = {**HINTS, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin", "Origin": HOST}
-        show("v2 aod (141+hints+cors, warmed)", s.get(AOD.format(a=asin), headers=xhr(asin, meta), timeout=30)); gap()
-        show("v2b aod repeat same session", s.get(AOD.format(a=asin), headers=xhr(asin, meta), timeout=30)); gap()
-        show("v2c aod2 endpoint", s.get(AOD2.format(a=asin), headers=xhr(asin, meta), timeout=30)); gap()
-        # v3: product page with aod=1 (is the panel server-rendered?)
-        r = s.get(f"{HOST}/dp/{asin}?aod=1", headers={**NAV, **HINTS}, timeout=30)
-        show("v3 dp?aod=1", r); gap()
-        # v4: fresh session, no warm-up, full hints
-        s4 = session(UA_141)
-        show("v4 aod cold (141+hints)", s4.get(AOD.format(a=asin), headers=xhr(asin, meta), timeout=30)); gap()
-        # v5: mobile UA, warmed on mobile dp
-        s5 = session(UA_MOB)
-        mob = {**NAV, "sec-ch-ua-mobile": "?1", "sec-ch-ua-platform": '"Android"'}
-        show("v5 dp warm (mobile)", s5.get(f"{HOST}/dp/{asin}", headers=mob, timeout=30)); gap()
-        show("v5 aod (mobile)", s5.get(AOD.format(a=asin), headers=xhr(asin, {"sec-ch-ua-mobile": "?1"}), timeout=30)); gap()
-        # v6: legacy offer-listing URL
-        show("v6 offer-listing", s.get(f"{HOST}/gp/offer-listing/{asin}?condition=all",
-                                       headers={**NAV, **HINTS}, timeout=30)); gap()
+    s = session(UA_141)
+    s.get(f"{HOST}/dp/B0FTMQQ7L2", headers={**NAV, **HINTS}, timeout=30); gap()
+    smid_probe(s, "B0FTMQQ7L2", "A1708Z2OZTF5YE", "256 smid Trocafone (non-buybox)"); gap()
+    smid_probe(s, "B0FTMQQ7L2", "A2TO0KKQTM1BAB", "256 smid CellularStore (buybox)"); gap()
+    smid_probe(s, "B0FTMQQ7L2", "A3SPPFNXUZXE4P", "256 smid Assurant (absent)"); gap()
+    smid_probe(s, "B0FTMWWS8Y", "A3SPPFNXUZXE4P", "512 smid Assurant"); gap()
+    smid_probe(s, "B0DSYJCY45", "A1ZZFT5FULY4LN", "new256 smid Amazon.com.br"); gap()
+    for _ in range(3):   # does the panel ever come back with the warmed session?
+        r = s.get(AOD.format(a="B0FTMQQ7L2"), headers=xhr("B0FTMQQ7L2"), timeout=30)
+        show("aod retry", r); gap()
 
 
 if __name__ == "__main__":
