@@ -51,7 +51,8 @@ def stub_scan(monkeypatch):
         [CashbackStatus(portal="inter", rate_pct=0.0, active=False, url="i")], []))
     monkeypatch.setattr(notify, "notify_coupons",
                         lambda blocks: sent.extend(blocks) or
-                        {"sent": len(blocks), "wa_ok": False, "ntfy_ok": DELIVERY["ok"]})
+                        {"sent": len(blocks), "wa_ok": False, "ntfy_ok": DELIVERY["ok"],
+                         "delivered": list(range(len(blocks))) if DELIVERY["ok"] else []})
     return sent
 
 
@@ -87,6 +88,9 @@ def test_scan_pings_valuable_new_codes_once(conn, stub_scan):
     # R$200 and R$150 clear COUPON_MIN_VALUE; the R$20-capped code doesn't
     assert len(stub_scan) == 2
     assert "OIPRIME15" in stub_scan[0] and "CUPOMSEMPRE" in stub_scan[1]
+    # aggregator codes are never subtracted until a cart test validates them
+    assert all("não validado — peça ao Claude para testar no carrinho" in b
+               for b in stub_scan)
     stub_scan.clear()
     run._scan_coupons(conn, LATER, dry_run=False, observations=[_amazon_obs()])
     assert stub_scan == []                       # already pinged
@@ -100,6 +104,31 @@ def test_scan_caps_pings_per_run(conn, stub_scan, monkeypatch):
     run._scan_coupons(conn, NOW, dry_run=False, observations=[])
     assert len(stub_scan) == run.COUPON_CAP
     assert "CODE7" in stub_scan[0]               # most valuable first
+
+
+def test_corroborated_codes_are_pinged_first(conn, stub_scan, monkeypatch):
+    codes = [
+        CouponCode(source="cuponomia", code="LONELY", abs_off=200.0),       # 1 site, undated
+        CouponCode(source="cuponomia,pelando", code="TWOSITES", abs_off=150.0),
+        CouponCode(source="promobit", code="DATED", abs_off=120.0, until="2099-12-31"),
+    ]
+    monkeypatch.setattr(coupons, "scan_codes", lambda session=None: (codes, []))
+    monkeypatch.setattr(run, "COUPON_CAP", 2)
+    run._scan_coupons(conn, NOW, dry_run=False, observations=[])
+    assert len(stub_scan) == 2
+    assert "TWOSITES" in stub_scan[0] and "DATED" in stub_scan[1]   # then by value
+    stub_scan.clear()
+    run._scan_coupons(conn, LATER, dry_run=False, observations=[])
+    assert len(stub_scan) == 1 and "LONELY" in stub_scan[0]          # held back, not lost
+
+
+def test_codes_that_failed_in_the_cart_are_not_pinged(conn, stub_scan, write_checks):
+    write_checks([{"code": "OIPRIME15", "works": False, "checked": "2026-10-22",
+                   "asin": "B0FTMWWS8Y", "seller_id": "A3SPPFNXUZXE4P",
+                   "cart_total": 4275.78, "discount": 0.0,
+                   "message": "O cupom de desconto inserido é inválido."}])
+    run._scan_coupons(conn, NOW, dry_run=False, observations=[_amazon_obs()])
+    assert len(stub_scan) == 1 and "CUPOMSEMPRE" in stub_scan[0]
 
 
 def test_dry_run_sends_and_records_nothing(conn, stub_scan):
@@ -154,20 +183,15 @@ def test_scan_survives_coupon_module_crash(conn, monkeypatch):
     run._scan_coupons(conn, NOW, dry_run=False, observations=[])  # no raise
 
 
-def test_amazon_summary_uses_pix_vs_code(conn):
-    o = _amazon_obs()
-    store.insert_observation(conn, o)
-    for c in _codes():
-        store.upsert_coupon(conn, c, NOW)
-    line = run._amazon_summary(conn, LATER)
-    assert "Pix R$ 3.723,05" in line and "cartão R$ 3.919,00" in line
-    assert "OIPRIME15: R$ 3.719,00" in line      # R$200 code beats Pix by R$4.05
-
-
-def test_amazon_summary_hides_code_that_loses_to_pix(conn):
+def test_amazon_reference_is_the_cheapest_12x_offer(conn):
     store.insert_observation(conn, _amazon_obs())
-    store.upsert_coupon(conn, _codes()[2], NOW)  # R$150 < R$195.95 Pix
-    assert "cupom" not in run._amazon_summary(conn, LATER)
+    pricier = _amazon_obs(card=4582.47, pix_discount=870.0)   # cheaper Pix, dearer 12x
+    pricier.listing_id = "B0FTMQQ7L2:A2TO0KKQTM1BAB:excelente"
+    store.insert_observation(conn, pricier)
+    assert run._amazon_reference(conn, [], LATER) == (3919.0, 3723.05)
+    bom = _amazon_obs(card=3000.0)                            # rank 2 never counts
+    bom.listing_id, bom.grade_rank = "B0FTMQQ7L2:X:bom", 2
+    assert run._amazon_reference(conn, [bom], LATER) == (3919.0, 3723.05)
 
 
 def test_coupon_messages_have_no_dollar_digit():
@@ -198,7 +222,9 @@ def test_vanished_offer_is_marked_sold_out_and_restock_fires(conn):
     back = _amazon_obs()
     back.ts = "2026-10-24T12:00:00+00:00"
     alerts = triggers.evaluate(conn, [back], back.ts)
-    assert "restock" in {x.trigger for x in alerts}
+    # R$ 3.919 is a 🟡 2026-low price, so the restock rides on that alert
+    assert any(x.trigger == "restock" or "voltou ao estoque" in (x.note or "")
+               for x in alerts)
 
 
 def test_sold_out_marking_ignores_old_and_already_out_rows(conn):

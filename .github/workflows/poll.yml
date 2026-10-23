@@ -1,76 +1,69 @@
-name: poll
+name: watch
+
+# The watcher: one job polls Amazon every ~4 min for ~5h45 (src/run.py loop)
+# and commits data/prices.db every 30 min + on exit (src/gitsync.py). The cron
+# fires every 30 min; scheduled and watch-mode runs share the s25-watch group,
+# so a new run waits in line behind the running one and starts as soon as it
+# ends. Manual dry/test runs get their own group and run at once (they never
+# push). Public repo -> Actions minutes are free. No Playwright: plain HTTP.
 
 on:
   schedule:
-    # Free-tier-safe: ~49 runs/day (~1500 billed min/mo, under the 2000 free tier).
-    - cron: '13,43 * * * *'   # every 30 min: tier-1 refurb poll (fast, no promos)
-    - cron: '0 12 * * *'      # 09:00 BRT (UTC-3): full sweep (all tiers + promos) + heartbeat
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: "poll | heartbeat | test | dry"
-        default: poll
+        description: "watch | dry | test"
+        type: choice
+        options: [watch, dry, test]
+        default: watch
 
 permissions:
-  contents: write          # needed to commit the DB back
-
-concurrency:
-  group: s25-poll
-  cancel-in-progress: false
+  contents: write          # the loop pushes the DB snapshots
 
 jobs:
-  poll:
+  watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
+    concurrency:
+      group: ${{ (github.event_name == 'schedule' || inputs.mode == 'watch') && 's25-watch' || format('s25-manual-{0}', github.run_id) }}
+      cancel-in-progress: false
     env:
+      PYTHONUNBUFFERED: "1"   # live log lines from the ~6h loop
       CALLMEBOT_PHONE:  ${{ secrets.CALLMEBOT_PHONE }}
       CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
       NTFY_TOPIC:       ${{ secrets.NTFY_TOPIC }}
     steps:
+      # The branch tip, not the event SHA: a queued run's SHA predates the
+      # previous watcher's final snapshots (the loop also pulls before polling).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0     # full history so pull --rebase / push work from the loop
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip          # cache pip downloads -> faster installs, cheaper runs
+          cache: pip
 
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Cache Playwright browser
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}
-
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-
-      - name: Refurb poll (every 30 min, tier-1, no promos)
-        if: github.event.schedule == '13,43 * * * *'
-        run: python -m src.run --poll --tier1 --no-promos
-
-      - name: Full sweep on demand (all tiers + promos)
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'poll'
-        run: python -m src.run --poll
-
-      - name: Daily full sweep + heartbeat
-        if: github.event.schedule == '0 12 * * *'
+      - name: Git identity for DB snapshots
         run: |
-          python -m src.run --poll --daily
-          python -m src.run --heartbeat
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Dry poll (no messages)
+      # exec: python must be the step's process so the runner's SIGINT/SIGTERM
+      # on cancel/timeout reach it and the exit sync runs (bash would swallow them).
+      - name: Watch (loop, commits the DB every 30 min)
+        if: github.event_name == 'schedule' || inputs.mode == 'watch'
+        run: exec python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800 --git-sync
+
+      - name: Dry poll (no messages, nothing committed)
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'dry'
         run: python -m src.run --poll --dry-run
 
       - name: Test alert
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
         run: python -m src.run --test-alert
-
-      - name: Commit price snapshot
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/prices.db
-          git commit -m "data: price snapshot $(date -u +%FT%TZ)" || echo "no changes"
-          git push

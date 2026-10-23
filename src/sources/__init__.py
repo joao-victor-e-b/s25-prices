@@ -3,13 +3,19 @@
 Maps a registry entry to a concrete Source subclass by importing
 ``src.sources.<module>`` and reading its ``SOURCE`` attribute. Returns None
 for sources whose scraper isn't implemented yet (Phase 2) so the orchestrator
-can skip them cleanly.
+can skip them cleanly. Entries with ``enabled: false`` stay in the registry
+(config kept) but ``run.load_registry`` drops them before anything polls.
 """
 from __future__ import annotations
 
 import importlib
 
 from .base import Source
+
+
+def is_enabled(cfg: dict) -> bool:
+    """Registry entries are on unless they say ``enabled: false``."""
+    return bool(cfg.get("enabled", True))
 
 
 def load_source(cfg: dict) -> Source | None:

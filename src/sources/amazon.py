@@ -1,4 +1,9 @@
-"""Amazon Seminovos scraper (source_id: amazon_seminovos).
+"""Amazon scraper: refurbished (Seminovos) and new-unit S25 Ultra listings.
+
+One registry entry per ASIN (256GB/512GB, Titânio Preto/JetBlack, seminovo or
+new are separate products); ``match.storage_gb`` decides which pages and offers
+belong to it, and ``default_grade`` names the condition of a buybox that shows
+none (a new-unit listing's dp says nothing; its AOD headings say "Novo").
 
 Amazon is robots-hostile and rate-limits aggressively, especially from
 datacenter IPs — the GitHub Actions runner may get a captcha where a home IP
@@ -26,6 +31,28 @@ price. Amazon folds that promo into the displayed price-to-pay, so the card
 price comes from elsewhere (dp: twister-plus JSON / "total parcelado"; AOD: the
 add-to-cart button's aria-label). The discount is the R$ difference Amazon
 shows, not card*pct, and is only credited when a Pix/NuPay promo is visible.
+When the card price can't be read but a Pix promo is live, the shown price is
+*not* the card price (that understated the 12x total by the Pix %): the card
+price is rebuilt from the sem-juros plan (n x installment) or, failing that,
+from the promo % (shown / (1 - pct), rounded up); otherwise the offer is
+dropped and the AOD page marked incomplete. Each case lands in ``degraded``.
+``coupon`` is a coupon Amazon displays on the offer, unless it's conditional
+(card, NuPay, Pix/boleto/à vista only, first purchase, app:
+``is_conditional_promo``). Both are stored raw even
+though Amazon applies only the larger of the two: the user pays in 12x, where
+only the coupon counts, so ``normalize`` applies the no-stack rule per payment
+path instead of this module discarding one of them.
+
+Every promotion shown on an offer (AOD promo rows, dp buybox promo blocks) is
+read one promotion item at a time (Amazon wraps each in a
+``data-csa-c-item-id="...amzn1.promotion.<ID>"`` element; hidden "cupom salvo"
+nodes dropped) and lands in the transient ``Observation.promos`` with its id in
+``promo_ids``, so the orchestrator can announce one it has never seen;
+``is_routine_promo`` tells the everyday Pix/NuPay "(5% off)" line apart.
+
+``blocked`` (set by fetch) is real pushback — captcha, an HTTP error, a dp
+that raised — as opposed to an empty listing (an AOD with no offers while the
+dp parsed fine), so the loop only backs off when Amazon actually resists.
 
 ``listing_id`` is ``{asin}:{seller_id}:{grade}`` (e.g.
 ``B0FTMQQ7L2:A2TO0KKQTM1BAB:excelente``): every seller shares the ASIN, and one
@@ -34,6 +61,7 @@ alert dedup. Amazon's offerListingId is a per-request token — never stable.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import random
@@ -79,8 +107,28 @@ _PIX_PROMO_RE = re.compile(
     r"|\b(?:pix|nupay)\b[^.()]{0,40}?\(\s*\d+\s*%\s*off", re.I)
 _MAX_PIX_SHARE = 0.15   # a "Pix" gap above this is some other price, not the promo
 _AMAZON_SELLER_ID = "A1ZZFT5FULY4LN"   # Amazon.com.br's own merchant id
-_COUPON_HINT_RE = re.compile(r"cupom|coupon|economize|aplicar", re.I)
+_COUPON_HINT_RE = re.compile(r"cupom|coupon|economize|aplicar|c[oó]digo", re.I)
+_PIX_PCT_RE = re.compile(r"(\d{1,2})\s*%\s*off", re.I)
+# dp buybox blocks that carry promotion messages (coupon widget, promo rows).
+_DP_PROMO_SELECTORS = (
+    "#promotionMessageInsideBuyBox_feature_div", "#couponsInBuybox_feature_div",
+    "#promoPriceBlockMessage_feature_div", "#applicablePromotionList_feature_div",
+    "#quickPromoBucketContent",
+)
+_PROMO_MAX_CHARS = 200
+# A bare installment line ("em até 12x de R$ 381,90 sem juros") is routine too;
+# anything naming a discount is not.
+_INSTALLMENT_LINE_RE = re.compile(r"\d+\s*x\b", re.I)
+_DISCOUNT_WORD_RE = re.compile(
+    r"cupom|coupon|economiz|desconto|\boff\b|%|cashback|frete|brinde|\bganhe\b|\bleve\b",
+    re.I)
+# One promotion inside a promo block: Amazon's item wrapper, else a bare
+# message span / coupon label.
+_PROMO_ITEM_SEL = ("[data-csa-c-item-id*='amzn1.promotion.'], span[id^='promoMessage'], "
+                   "label[id^='couponText']")
+_AOD_PROMO_BLOCK = "aod-offer-promotion-"
 _OFFER_ID_RE = re.compile(r"""id\s*=\s*["']aod-(?:pinned-)?offer["']""")
+_NO_OFFERS = "no offers in panel"   # an empty listing, not necessarily a block
 _CAPTCHA_MARKERS = (
     "validateCaptcha", "Digite os caracteres", "Enter the characters",
     "Type the characters you see",
@@ -138,7 +186,7 @@ def _storage_gb(title: str | None) -> int | None:
 
 
 def _find_color(text: str) -> str | None:
-    t = (text or "").lower()
+    t = (text or "").lower().replace("jet black", "jetblack")
     for c in _COLORS:
         if c in t:
             return c
@@ -180,12 +228,13 @@ def _split_pix(card: float | None, shown: float | None,
 
     The discount is credited only when a Pix/NuPay promo explains the gap, and
     is the R$ difference Amazon shows (its rounding differs from card*pct). A
-    missing card price means shown is taken as card with no discount (never
-    guess); a "card" price *below* the price-to-pay must belong to some other
-    offer, so the price-to-pay wins.
+    missing card price means shown is taken as card with no discount — but only
+    without a Pix promo: under one, shown is the Pix price, so the card price is
+    unknown (None; see ``_derive_card``). A "card" price *below* the
+    price-to-pay must belong to some other offer, so the price-to-pay wins.
     """
     if card is None:
-        return shown, 0.0
+        return (None, 0.0) if pix_promo else (shown, 0.0)
     if shown is None:
         return card, 0.0
     if shown < card and pix_promo and card - shown <= card * _MAX_PIX_SHARE:
@@ -195,19 +244,234 @@ def _split_pix(card: float | None, shown: float | None,
     return card, 0.0
 
 
-def _no_stack(o: Observation) -> Observation:
-    """Amazon's Pix/NuPay promo "não pode ser combinada com outras ofertas" — the
-    larger of it and a clip coupon applies, never both (PV subtracts both)."""
-    if (o.pix_discount or 0) > 0 and (o.coupon or 0) > 0:
-        if o.coupon > o.pix_discount:
-            o.pix_discount = 0.0
-        else:
-            o.coupon = 0.0
-    return o
+def _pix_pct(texts) -> float | None:
+    """The Pix/NuPay promo percentage ("(5% off)") from the first Pix promo
+    line among ``texts``, or None when no Pix promo is shown."""
+    for t in texts:
+        if t and _PIX_PROMO_RE.search(t):
+            m = _PIX_PCT_RE.search(t)
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def _derive_card(shown: float | None, pct: float | None,
+                 plan_total: float | None = None) -> float | None:
+    """The card price when only the Pix price is shown: the sem-juros plan's
+    total (n x installment, what the user pays in 12x) when it's a plausible
+    Pix gap above shown, else shown / (1 - pct) rounded *up* to the cent (an
+    overestimate by a cent never fires a false alert; an underestimate might).
+    None when neither is available."""
+    if shown is None:
+        return None
+    if plan_total and 0 < plan_total - shown <= plan_total * _MAX_PIX_SHARE:
+        return round(plan_total, 2)
+    if pct and 0 < pct < 100:
+        card = math.ceil(shown / (1 - pct / 100) * 100 - 1e-6) / 100
+        if 0 < card - shown <= card * _MAX_PIX_SHARE:
+            return card
+    return None
 
 
 def _cash_price(o: Observation) -> float:
-    return (o.list_price or math.inf) - (o.pix_discount or 0.0) - (o.coupon or 0.0)
+    """Pix price under Amazon's no-stack rule (the larger discount applies)."""
+    return (o.list_price or math.inf) - max(o.pix_discount or 0.0, o.coupon or 0.0)
+
+
+def _rank(o: Observation) -> tuple:
+    """Which copy of a listing to keep: lowest 12x total (the alert metric),
+    then lowest Pix price, then one that carries the installment plan."""
+    total = (o.list_price - (o.coupon or 0.0)) if o.list_price is not None else math.inf
+    return (total, _cash_price(o), 0 if o.installments_n else 1)
+
+
+def _full_promo_text(el) -> str:
+    """A promo element's visible text, whitespace squashed; hidden nodes (the
+    "cupom foi salvo" confirmation) are dropped from a copy first."""
+    if el is None:
+        return ""
+    el = copy.copy(el)
+    for hidden in el.select(".aok-hidden"):
+        hidden.decompose()
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+
+
+def _outermost(found: list) -> list:
+    """Drop elements nested inside another element of ``found``."""
+    ids = {id(e) for e in found}
+    return [e for e in found if not any(id(p) in ids for p in e.parents)]
+
+
+def _promo_elements(container) -> list:
+    """One element per promotion inside a dp promo block: the item wrappers
+    (or bare message spans/labels), else the whole block."""
+    if container is None:
+        return []
+    return _outermost(container.select(_PROMO_ITEM_SEL)) or [container]
+
+
+def _aod_promo_elements(block) -> list:
+    """One element per promotion in an AOD offer, in document order: each
+    item inside a div#aod-offer-promotion-N (the whole div only when it holds
+    no item), plus bare promoMessage spans outside those divs. A promo used to
+    come out twice (div text with link labels + its inner span), and two promos
+    sharing a div came out as one string whose Pix "NuPay" voided the coupon."""
+    out, items = [], set()
+    for el in block.select(f"[id^='{_AOD_PROMO_BLOCK}'], {_PROMO_ITEM_SEL}"):
+        if (el.get("id") or "").startswith(_AOD_PROMO_BLOCK):
+            if not el.select(_PROMO_ITEM_SEL):
+                out.append(el)          # a plain block is one promotion
+            continue
+        if any(id(p) in items for p in el.parents):
+            continue                    # nested inside an item already taken
+        items.add(id(el))
+        out.append(el)
+    return out
+
+
+_PROMO_ID_RE = re.compile(r"amzn1\.promotion\.([A-Z0-9]{8,20})")
+
+
+def _promo_id(el) -> str | None:
+    """The Amazon promotion id of one promo element: its own data-csa-c-item-id
+    ("amzn1.asin.X:amzn1.promotion.<ID>"), an unambiguous single item inside it,
+    or an enclosing item's — never a sibling's (stops at the promo block)."""
+    if hasattr(el, "select"):
+        ids = {m.group(1) for i in el.select("[data-csa-c-item-id*='amzn1.promotion.']")
+               if (m := _PROMO_ID_RE.search(i.get("data-csa-c-item-id") or ""))}
+        if len(ids) == 1:
+            return ids.pop()
+        if ids:
+            return None                 # a container of several promos: ambiguous
+    node = el
+    for _ in range(4):
+        if node is None or not hasattr(node, "get"):
+            return None
+        m = _PROMO_ID_RE.search(node.get("data-csa-c-item-id") or "")
+        if m:
+            return m.group(1)
+        if (node.get("id") or "").startswith(_AOD_PROMO_BLOCK):
+            return None                 # never borrow a sibling's id from the block
+        node = node.parent
+    return None
+
+
+def _collect_promos(elements, list_price_hint=None) -> tuple[list[str], dict[str, str], list[str]]:
+    """(display texts, display text -> promo id, full texts) for promo elements,
+    de-duplicated. Checks (coupon, conditional) run on the full text; only the
+    stored display string is cut to _PROMO_MAX_CHARS."""
+    promos: list[str] = []
+    ids: dict[str, str] = {}
+    full: list[str] = []
+    for el in elements:
+        text = _full_promo_text(el)
+        if not text:
+            continue
+        shown = text[:_PROMO_MAX_CHARS]
+        if shown in promos:
+            continue
+        promos.append(shown)
+        full.append(text)
+        pid = _promo_id(el)
+        if pid:
+            ids[shown] = pid
+    return promos, ids, full
+
+
+def promo_terms(session, promo_id: str, max_chars: int = 240) -> str | None:
+    """Public terms of an Amazon promotion (GET /promotion/tnc/<ID>, JSON), cut
+    to the first sentences — e.g. the "Até R$ 50 de desconto ... primeira
+    compra ... Cartão Amazon" conditions a promo line doesn't show. Best-effort:
+    None on any failure."""
+    try:
+        r = session.get(f"{_HOST}/promotion/tnc/{promo_id}",
+                        headers={**_aod_headers(""), "Referer": _HOST + "/"},
+                        timeout=20)
+        if r.status_code != 200:
+            return None
+        content = (r.json().get("tncSectionContentMap") or {}).get("TNC_CONTENT") or ""
+    except Exception:
+        return None
+    text = re.sub(r"\(https?://[^)]*\)", "", content)   # drop category link dumps
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0] + "…"
+    return text or None
+
+
+def _fold(s: str | None) -> str:
+    """Lowercase, accent-free ("1ª compra com cartão" -> "1a compra com cartao")."""
+    return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+
+
+# Conditions the user can't meet (or that don't fit paying 12x on their card):
+# a specific card (Cartão Amazon, a bank/brand), any bank or wallet named on its
+# own ("clientes Itaú", "com Mercado Pago"), NuPay/Nubank, Pix/boleto/à vista
+# only, first purchase, app only, or several units ("ao comprar 2 itens").
+# Prime-only is fine — the user has Prime.
+_CARD_BRANDS = (r"amazon|itau|bradesco|santander|nubank|c6|inter\b|caixa|banco do brasil|"
+                r"bb\b|porto|mercado pago|picpay|elo\b|visa|master(?:card)?|amex|"
+                r"american express|hipercard|xp\b|btg|neon|pan\b|sicredi|sicoob|ourocard")
+_BANKS_AND_WALLETS = (
+    r"itau|bradesco|santander|mercado\s+pago|picpay|banco\s+inter|inter|c6(?:\s+bank)?|"
+    r"nubank|nupay|caixa|banco\s+do\s+brasil|btg(?:\s+pactual)?|sicredi|sicoob|ourocard|"
+    r"banco\s+pan|neon|porto\s+(?:bank|seguro)|american\s+express|amex|hipercard|"
+    r"mastercard|visa|ame\s+digital|pagbank|pagseguro|will\s+bank")
+_MULTI = r"(?:[2-9]|\d{2,})"   # two or more units
+_CONDITIONAL_PROMO_RE = re.compile(
+    rf"cart(?:ao|oes)\s+(?:de\s+credito\s+)?(?:d[oa]s?\s+)?(?:{_CARD_BRANDS})"
+    rf"|\b(?:{_BANKS_AND_WALLETS})\b"
+    r"|\bpix\b|\bboleto\b|\ba\s+vista\b"
+    r"|\b(?:primeira|1a)\s+compra|primeiro\s+pedido"
+    r"|\b(?:app|aplicativo)\b"
+    rf"|\b(?:compr(?:ar|a|e)|leve|levando)\s+(?:de\s+)?{_MULTI}\b"
+    rf"|\bna\s+compra\s+de\s+{_MULTI}\b"
+    rf"|\b{_MULTI}\s+(?:itens|unidades|item\(ns\)|produtos)")
+
+
+def is_conditional_promo(message: str | None) -> bool:
+    """Does an Amazon-shown promo carry a condition the user can't count on
+    (a specific payment card, NuPay/Nubank or Pix/boleto/à vista only, first
+    purchase, app only)?
+    Such a promo is still announced, but never feeds ``coupon``: the 12x
+    total must only fall by discounts the user's own checkout gets."""
+    return bool(_CONDITIONAL_PROMO_RE.search(_fold(message)))
+
+
+def _shown_coupon(text: str | None, list_price: float | None) -> float:
+    """R$ off from an Amazon-shown coupon message, unless it's conditional."""
+    if is_conditional_promo(text):
+        return 0.0
+    return coupon_from_text(text, list_price)
+
+
+_PIX_ONLY_RE = re.compile(r"\bpix\b|\ba\s+vista\b")
+_CODE_WORD_RE = re.compile(r"cupom|codigo")
+_DISCOUNT_SIGNAL_RE = re.compile(r"r\$|%|cupom|codigo|desconto|economiz|\boff\b|cashback")
+
+
+def is_routine_promo(message: str | None) -> bool:
+    """Lines that never warrant a new-promotion alert: the everyday Pix/NuPay
+    "(N% off)" promo and other Pix/à-vista-only price lines without a code
+    (their amount moves with the price, so each move would look new), a bare
+    installment plan, and lines with no discount at all ("90 dias de Amazon
+    Music grátis", "Frete GRÁTIS")."""
+    m = message or ""
+    f = _fold(m)
+    if _PIX_PROMO_RE.search(m):
+        return True
+    if _PIX_ONLY_RE.search(f) and not _CODE_WORD_RE.search(f):
+        return True
+    if not _DISCOUNT_SIGNAL_RE.search(f):
+        return True
+    return bool(_INSTALLMENT_LINE_RE.search(m)) and not _DISCOUNT_WORD_RE.search(m)
+
+
+def parse_listing_id(listing_id: str) -> tuple[str, str]:
+    """(asin, seller_id) from ``{asin}:{seller_id}:{grade}``; seller_id is the
+    seller slug when the page hid the id."""
+    parts = (listing_id or "").split(":")
+    return parts[0], (parts[1] if len(parts) > 1 else "")
 
 
 def aod_block_reason(status: int, html: str) -> str | None:
@@ -224,8 +488,11 @@ def aod_block_reason(status: int, html: str) -> str | None:
     if "/error/500" in html:
         return "error page (/error/500)"
     if not _OFFER_ID_RE.search(html):
-        return "no offers in panel (blocked or layout change)"
+        return f"{_NO_OFFERS} (empty listing, blocked or layout change)"
     return None
+
+
+_UNPRICED = object()   # _aod_offer: offer dropped, card price unknown under a Pix promo
 
 
 @dataclass
@@ -251,11 +518,15 @@ class AmazonSeminovosSource(Source):
         self.match = {**_DEFAULT_MATCH, **(cfg.get("match") or {})}
         self.asin = cfg.get("asin")
         self.product_url = cfg.get("url") or f"{_HOST}/dp/{self.asin}"
+        self.default_grade = cfg.get("default_grade")   # e.g. "Novo" for new units
         # Set by fetch() for the orchestrator: ``complete`` means the result is
         # every live offer (so listings missing from it can be marked sold
-        # out); ``degraded`` lists partial-fetch reasons for the run log.
+        # out); ``degraded`` lists partial-fetch reasons for the run log;
+        # ``blocked`` is real pushback (the loop backs off only on that).
         self.complete = False
         self.degraded: list[str] = []
+        self.blocked = False
+        self.notes: list[str] = []   # parse-level problems (missing card price)
 
     # --- orchestration ----------------------------------------------------
 
@@ -269,11 +540,16 @@ class AmazonSeminovosSource(Source):
         errors: list[str] = []
         self.complete = False
         self.degraded = []
+        self.blocked = False
+        self.notes = []
+        dp_ok = False
 
         try:
             dp, asin = self._fetch_dp(asin)
-        except Exception as e:  # captcha, HTTP error, layout change
+            dp_ok = True
+        except Exception as e:  # captcha, HTTP error, no title: Amazon resisting
             errors.append(f"dp: {e}")
+            self.blocked = True
 
         if asin:
             self._pause()
@@ -281,13 +557,21 @@ class AmazonSeminovosSource(Source):
                 aod = self._fetch_aod(asin)
             except Exception as e:
                 errors.append(f"aod: {e}")
+                # An AOD without offers next to a dp that parsed fine is an
+                # empty listing (sold out), not pushback.
+                if not (dp_ok and _NO_OFFERS in str(e)):
+                    self.blocked = True
         else:
             errors.append("aod: no ASIN configured")
 
         if len(errors) == 2:  # neither the dp nor the AOD gave us anything
             raise RuntimeError("amazon: " + "; ".join(errors))
+        if aod is not None and aod.offers and not any(self._matches(o) for o in aod.offers):
+            aod.complete = False  # a panel for some other product never counts
         if aod is not None and not aod.complete:
-            errors.append("aod: incomplete (extra page failed or variation drift)")
+            errors.append("aod: incomplete (extra page failed, unpriced offer or "
+                          "variation drift)")
+        errors += self.notes
         if errors:  # degraded but usable — leave a trace in the run log
             print(f"[amazon] partial fetch: {'; '.join(errors)}", file=sys.stderr)
             self.degraded = errors
@@ -296,7 +580,8 @@ class AmazonSeminovosSource(Source):
 
     def combine(self, dp: Observation | None, aod: AodPage | None) -> list[Observation]:
         """Merge the dp buybox into the AOD offers; keep target offers, one per
-        listing_id (cheapest wins)."""
+        listing_id: the lowest 12x total wins (``_rank``), and an installment
+        plan on the dropped copy at the same card price is kept."""
         offers: list[Observation] = []
         if aod is not None:
             pinned = aod.pinned if aod.pinned is not None and self._matches(aod.pinned) else None
@@ -312,18 +597,24 @@ class AmazonSeminovosSource(Source):
         for o in offers:
             if not self._matches(o):
                 continue
-            _no_stack(o)
             cur = best.get(o.listing_id)
-            if cur is None or _cash_price(o) < _cash_price(cur):
+            if cur is None:
                 best[o.listing_id] = o
+                continue
+            keep, drop = (o, cur) if _rank(o) < _rank(cur) else (cur, o)
+            if (not keep.installments_n and drop.installments_n
+                    and keep.list_price == drop.list_price):
+                keep.installments_n, keep.installment_value, keep.interest_flag = \
+                    drop.installments_n, drop.installment_value, drop.interest_flag
+            best[o.listing_id] = keep
         return list(best.values())
 
     @staticmethod
     def _merge_buybox(pinned: Observation, dp: Observation) -> bool:
-        """Copy the dp installment plan (and clip coupon) onto the AOD pinned
-        offer when both describe the same grade at the same card price — a
-        different price means the buybox moved between the two requests and the
-        plan would be stale. The seller keys normally agree too, but a page that
+        """Copy the dp installment plan, clip coupon and promo messages onto
+        the AOD pinned offer when both describe the same grade at the same card
+        price — a different price means the buybox moved between the two
+        requests and the plan would be stale. The seller keys normally agree too, but a page that
         hides the seller id (slug fallback) must not lose the merge: the pinned
         offer *is* the buybox, and an equal card price to the cent is proof."""
         if pinned.list_price is None or dp.list_price is None:
@@ -338,6 +629,11 @@ class AmazonSeminovosSource(Source):
             pinned.interest_flag = False
         if not pinned.coupon and dp.coupon:
             pinned.coupon = dp.coupon
+        for msg in dp.promos:
+            if msg not in pinned.promos:
+                pinned.promos.append(msg)
+                if msg in dp.promo_ids:
+                    pinned.promo_ids[msg] = dp.promo_ids[msg]
         return True
 
     def _pause(self) -> None:
@@ -359,7 +655,7 @@ class AmazonSeminovosSource(Source):
 
         # The configured ASIN is a variation family whose default child rotates
         # (256GB one poll, 512GB the next). If the parent didn't land on our
-        # target, follow the twister to the 256GB Preto/JetBlack child.
+        # target, follow the twister to the configured storage's Preto child.
         for child in self._target_children(r.content):
             if child == asin:
                 continue
@@ -376,7 +672,7 @@ class AmazonSeminovosSource(Source):
 
     def _target_children(self, content: bytes) -> list[str]:
         """ASINs from the variation twister whose values match the target
-        storage + color (so we can deep-link the 256GB Preto child)."""
+        storage + color (so we can deep-link e.g. the 256GB Preto child)."""
         html = content.decode("utf-8", "ignore")
         m = re.search(r'"dimensionValuesDisplayData"\s*:\s*(\{.*?\})\s*,\s*"', html, re.S)
         if not m:
@@ -408,36 +704,11 @@ class AmazonSeminovosSource(Source):
         if not title_el:
             raise RuntimeError("amazon: no product title (blocked or layout change)")
         title = title_el.get_text(strip=True)
-        tl = title.lower()
-        if "s25 ultra" not in tl or "256" not in tl:
-            return None  # wrong product
+        if not self._is_target_title(title):
+            return None  # wrong product (other model or the other storage)
 
         card, shown = self._dp_prices(soup, html)
-        list_price, pix_discount = _split_pix(card, shown, self._dp_pix_promo(soup))
-        if not list_price:
-            return None  # no buybox price -> treat as unavailable
-
-        cond_el = soup.select_one(".a-text-bold.a-text-normal")
-        grade_raw = _grade_from_heading(_text(cond_el)) if cond_el else None
-        # Buybox layout varies; fall back to the condition description text
-        # ("...em condição Excelente foi inspecionado...").
-        if not grade_raw or grade_raw.lower().startswith("seminovo"):
-            m = re.search(
-                r"condi[çc][ãa]o\s+(Excelente|Muito Bom|Bom|Aceit[áa]vel|Premium|Como novo)",
-                html, re.I)
-            if m:
-                grade_raw = m.group(1)
-
-        # #availability is missing on many page variants (CI gets them often);
-        # then a live add-to-cart button is the in-stock signal.
-        at = _text(soup.select_one("#availability")).lower()
-        if "indispon" in at or "sem estoque" in at or "não disponível" in at:
-            in_stock = False
-        elif "estoque" in at:
-            in_stock = True
-        else:
-            in_stock = soup.select_one(
-                "#add-to-cart-button, input[name='submit.add-to-cart']") is not None
+        pix_pct = self._dp_pix_pct(soup)   # None when no Pix promo is shown
 
         # longest sem-juros installment plan
         installments_n = installment_value = None
@@ -451,11 +722,50 @@ class AmazonSeminovosSource(Source):
             installments_n, installment_value = best
             interest_flag = False
 
-        # clip-coupon widget in the buybox (folds into PV via the coupon field)
-        coupon = 0.0
-        cel = soup.select_one("#couponsInBuybox_feature_div")
-        if cel:
-            coupon = coupon_from_text(cel.get_text(" ", strip=True), list_price)
+        if card is None and pix_pct is not None and shown is not None:
+            plan_total = (installments_n * installment_value
+                          if installments_n and installment_value else None)
+            card = _derive_card(shown, pix_pct, plan_total)
+            self.notes.append("dp: card price missing under Pix promo"
+                              + ("" if card is None else f" (rebuilt: {card:.2f})"))
+            if card is None:
+                return None  # unknown card price: never alert on the Pix price
+        list_price, pix_discount = _split_pix(card, shown, pix_pct is not None)
+        if not list_price:
+            return None  # no buybox price -> treat as unavailable
+
+        cond_el = soup.select_one(".a-text-bold.a-text-normal")
+        grade_raw = _grade_from_heading(_text(cond_el)) if cond_el else None
+        # Buybox layout varies; fall back to the condition description text
+        # ("...em condição Excelente foi inspecionado...").
+        if not grade_raw or grade_raw.lower().startswith("seminovo"):
+            m = re.search(
+                r"condi[çc][ãa]o\s+(Excelente|Muito Bom|Bom|Aceit[áa]vel|Premium|Como novo)",
+                html, re.I)
+            if m:
+                grade_raw = m.group(1)
+        if not grade_raw:
+            grade_raw = self.default_grade   # new-unit listings name no condition
+
+        # #availability is missing on many page variants (CI gets them often);
+        # then a live add-to-cart button is the in-stock signal.
+        at = _text(soup.select_one("#availability")).lower()
+        if "indispon" in at or "sem estoque" in at or "não disponível" in at:
+            in_stock = False
+        elif "estoque" in at:
+            in_stock = True
+        else:
+            in_stock = soup.select_one(
+                "#add-to-cart-button, input[name='submit.add-to-cart']") is not None
+
+        # First block per selector only: pages with a new/used accordion repeat
+        # these ids for the secondary offer, whose messages aren't the buybox's.
+        elements = [el for sel in _DP_PROMO_SELECTORS
+                    for el in _promo_elements(soup.select_one(sel))]
+        promos, promo_ids, full = _collect_promos(elements)
+        # clip coupons / codes shown in the buybox (fold into the 12x total)
+        coupon = max((_shown_coupon(t, list_price) for t in full
+                      if _COUPON_HINT_RE.search(t)), default=0.0)
 
         seller = self._seller(soup)
         mid = soup.select_one("input#merchantID")
@@ -487,7 +797,17 @@ class AmazonSeminovosSource(Source):
             installment_value=installment_value,
             interest_flag=interest_flag,
             in_stock=in_stock,
+            promos=promos,
+            promo_ids=promo_ids,
         )
+
+    def _is_target_title(self, title: str | None) -> bool:
+        """An S25 Ultra whose storage (first non-RAM size in the title) is the
+        configured ``match.storage_gb``."""
+        if "s25 ultra" not in (title or "").lower():
+            return False
+        want = self.match.get("storage_gb")
+        return not want or _storage_gb(title) == want
 
     @staticmethod
     def _dp_prices(soup, html: str) -> tuple[float | None, float | None]:
@@ -531,17 +851,15 @@ class AmazonSeminovosSource(Source):
         return card, shown
 
     @staticmethod
-    def _dp_pix_promo(soup) -> bool:
-        """Is a Pix/NuPay promo shown in the buybox ("5% off à vista no Pix ou
-        NuPay")? Only then may a price-to-pay below card count as pix_discount.
-        Matches the promo wording, not a bare "Pix" (the payment-methods popover
-        inside #apex_desktop lists Pix on every page)."""
-        for sel in ("#promotionMessageInsideBuyBox_feature_div",
-                    "#oneTimePaymentPrice_feature_div", "#apex_desktop",
-                    "#corePrice_feature_div"):
-            if _PIX_PROMO_RE.search(_text(soup.select_one(sel))):
-                return True
-        return False
+    def _dp_pix_pct(soup) -> float | None:
+        """The Pix/NuPay promo % shown in the buybox ("5% off à vista no Pix ou
+        NuPay"), or None. Only with it may a price-to-pay below card count as
+        pix_discount. Matches the promo wording, not a bare "Pix" (the
+        payment-methods popover inside #apex_desktop lists Pix on every page)."""
+        return _pix_pct(_text(soup.select_one(sel)) for sel in (
+            "#promotionMessageInsideBuyBox_feature_div",
+            "#oneTimePaymentPrice_feature_div", "#apex_desktop",
+            "#corePrice_feature_div"))
 
     @staticmethod
     def _seller(soup) -> str:
@@ -607,21 +925,33 @@ class AmazonSeminovosSource(Source):
         except (TypeError, ValueError):
             total = None
         page = AodPage(pinned=None, total=total, title=title)
-        if title and "s25 ultra" not in title.lower():
-            page.complete = False  # variation drift: AOD for some other product
+        if not self._is_target_title(title):
+            # missing title, another model, or the sibling storage's panel:
+            # nothing here can prove which listings sold out
+            page.complete = False
             return page
 
         blocks = [(True, b) for b in soup.select("#aod-pinned-offer")]
         blocks += [(False, b) for b in soup.select("#aod-offer")]
+        unpriced = 0
+        self._derived = 0
         for is_pinned, block in blocks:
             if block.find_parent(id="aod-sticky-pinned-offer"):
                 continue
             o = self._aod_offer(asin, block, title)
+            if o is _UNPRICED:
+                unpriced += 1
+                page.complete = False   # a dropped offer must not read as sold out
+                continue
             if o is None:
                 continue
             if is_pinned and page.pinned is None:
                 page.pinned = o
             page.offers.append(o)
+        if unpriced:
+            self.notes.append(f"aod: {unpriced} offer(s) without card price under Pix promo")
+        if self._derived:
+            self.notes.append(f"aod: {self._derived} card price(s) rebuilt from the Pix %")
         return page
 
     def _aod_offer(self, asin: str, block, title: str | None) -> Observation | None:
@@ -643,24 +973,25 @@ class AmazonSeminovosSource(Source):
             if digits and frac.isdigit():
                 shown = float(f"{digits}.{frac}")
 
-        promos: list[str] = []
-        for el in block.select("[id^='aod-offer-promotion-'], span[id^='promoMessage']"):
-            t = _text(el)
-            if t and t not in promos:
-                promos.append(t)
-        list_price, pix_discount = _split_pix(
-            card, shown, any(_PIX_PROMO_RE.search(p) for p in promos))
+        promos, promo_ids, full = _collect_promos(_aod_promo_elements(block))
+        pix_pct = _pix_pct(full)
+        if card is None and pix_pct is not None:
+            card = _derive_card(shown, pix_pct)
+            if card is None:
+                return _UNPRICED  # the shown price is the Pix price: never use it
+            self._derived = getattr(self, "_derived", 0) + 1
+        list_price, pix_discount = _split_pix(card, shown, pix_pct is not None)
         if not list_price:
             return None
-        coupon = max((coupon_from_text(p, list_price) for p in promos
-                      if _COUPON_HINT_RE.search(p)), default=0.0)
+        coupon = max((_shown_coupon(t, list_price) for t in full
+                      if _COUPON_HINT_RE.search(t)), default=0.0)
 
         seller, seller_id = self._aod_seller(block)
         if not seller:
             sm = _ATC_SELLER_RE.search(label)
             seller = sm.group(1).strip() if sm else self.seller
 
-        return Observation(
+        obs = Observation(
             source_id=self.source_id,
             seller=seller[:60],
             venue=self.venue,
@@ -680,7 +1011,10 @@ class AmazonSeminovosSource(Source):
             interest_flag=None,
             in_stock=block.select_one(
                 "input[name='submit.addToCart'], [data-aod-atc-action]") is not None,
+            promos=promos,
+            promo_ids=promo_ids,
         )
+        return obs
 
     @staticmethod
     def _aod_seller(block) -> tuple[str | None, str | None]:

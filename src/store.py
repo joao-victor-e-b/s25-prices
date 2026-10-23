@@ -2,6 +2,16 @@
 
 The DB (data/prices.db) is committed to the repo to give a portable price
 history for free. Credentials are never stored here.
+
+The watcher polls every ~4 minutes, so ``insert_observation`` skips a snapshot
+identical to the listing's latest stored one when that row is under an hour
+old: the committed DB stays small while every listing still gets at least one
+row per hour (the heartbeat's and sold-out marking's "seen since" windows rely
+on that). Triggers never read this back for the current poll — they get the
+in-memory observations — so nothing is lost by skipping.
+
+The committed DB predates some columns; ``init_db`` adds missing ones in place
+(``_ADDED_COLUMNS``) because CREATE TABLE IF NOT EXISTS never alters a table.
 """
 from __future__ import annotations
 
@@ -28,6 +38,7 @@ CREATE TABLE IF NOT EXISTS observations (
   list_price        NUMERIC,
   pix_discount      NUMERIC DEFAULT 0,
   coupon            NUMERIC DEFAULT 0,
+  coupon_code       TEXT,          -- validated code behind coupon (NULL = Amazon-shown)
   cashback          NUMERIC DEFAULT 0,
   installments_n    INTEGER,
   installment_value NUMERIC,
@@ -40,6 +51,8 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_seller_grade_ts ON observations(seller, grade_rank, ts);
 CREATE INDEX IF NOT EXISTS idx_pv ON observations(pv);
 
+-- pv holds the metric the alert was judged on: the 12x card total for price
+-- thresholds, PV for the other triggers (dedup compares like with like).
 CREATE TABLE IF NOT EXISTS alerts_sent (
   ts          TIMESTAMP,
   listing_id  TEXT,
@@ -86,6 +99,17 @@ CREATE TABLE IF NOT EXISTS cashback_status (
   PRIMARY KEY (portal, store, ts)
 );
 
+-- Promotion messages Amazon showed on an offer (asin + seller), so a message
+-- seen for the first time can be announced once.
+CREATE TABLE IF NOT EXISTS offer_promos (
+  asin        TEXT NOT NULL,
+  seller_id   TEXT NOT NULL,
+  message     TEXT NOT NULL,
+  first_seen  TIMESTAMP NOT NULL,
+  last_seen   TIMESTAMP NOT NULL,
+  PRIMARY KEY (asin, seller_id, message)
+);
+
 -- One row per poll so the heartbeat can report real failure counts
 -- (stderr in the Actions log is invisible day to day).
 CREATE TABLE IF NOT EXISTS run_log (
@@ -97,6 +121,17 @@ CREATE TABLE IF NOT EXISTS run_log (
   detail         TEXT
 );
 """
+
+# Columns added after the committed DB was created: {table: {column: decl}}.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "observations": {"coupon_code": "TEXT"},
+}
+
+# A listing re-stores an unchanged snapshot only after this long (see module doc).
+UNCHANGED_REFRESH_MINUTES = 60
+# Fields whose change makes a snapshot worth storing even inside that hour.
+_CHANGE_FIELDS = ("list_price", "pix_discount", "coupon", "coupon_code",
+                  "installments_n", "installment_value", "in_stock", "grade_raw")
 
 
 def now_iso() -> str:
@@ -113,10 +148,57 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()
 
 
-def insert_observation(conn: sqlite3.Connection, obs: Observation) -> None:
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, cols in _ADDED_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+def _same(a, b) -> bool:
+    """Equality for values read back from SQLite: NUMERIC comes back as int or
+    float and BOOLEAN as 0/1, so numbers compare to the cent (True == 1)."""
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 0.005
+    return a == b
+
+
+def _unchanged_recently(conn: sqlite3.Connection, obs: Observation) -> bool:
+    """Is the listing's latest stored row identical (``_CHANGE_FIELDS``) and
+    younger than UNCHANGED_REFRESH_MINUTES?"""
+    if not obs.ts:
+        return False
+    prev = conn.execute(
+        "SELECT * FROM observations WHERE source_id=? AND listing_id=? "
+        "ORDER BY ts DESC LIMIT 1",
+        (obs.source_id, obs.listing_id),
+    ).fetchone()
+    if prev is None or prev["ts"] >= obs.ts:
+        return False
+    try:
+        age = datetime.fromisoformat(obs.ts) - datetime.fromisoformat(prev["ts"])
+    except ValueError:
+        return False
+    if age >= timedelta(minutes=UNCHANGED_REFRESH_MINUTES):
+        return False
+    keys = set(prev.keys())
+    return all(_same(getattr(obs, f), prev[f] if f in keys else None)
+               for f in _CHANGE_FIELDS)
+
+
+def insert_observation(conn: sqlite3.Connection, obs: Observation,
+                       dedup: bool = True) -> bool:
+    """Store one snapshot; returns False when it was skipped as an unchanged
+    repeat (``dedup``; see the module docstring)."""
+    if dedup and _unchanged_recently(conn, obs):
+        return False
     row = obs.as_row()
     cols = ", ".join(row.keys())
     placeholders = ", ".join(f":{k}" for k in row.keys())
@@ -124,6 +206,7 @@ def insert_observation(conn: sqlite3.Connection, obs: Observation) -> None:
         f"INSERT OR REPLACE INTO observations ({cols}) VALUES ({placeholders})",
         row,
     )
+    return True
 
 
 def insert_promo(conn: sqlite3.Connection, promo, ts: str) -> None:
@@ -199,9 +282,142 @@ def mark_missing_out_of_stock(conn: sqlite3.Connection, source_id: str,
             continue
         o = Observation.from_row(r)
         o.ts, o.in_stock, o.pv = ts, False, None
-        insert_observation(conn, o)
+        insert_observation(conn, o, dedup=False)   # the sold-out row must land
         marked.append(o.listing_id)
     return marked
+
+
+def upsert_offer_promo(conn: sqlite3.Connection, asin: str, seller_id: str,
+                       message: str, ts: str) -> bool:
+    """Record a promotion message seen on an offer. Returns True the first
+    time this (asin, seller_id, message) is seen."""
+    row = conn.execute(
+        "SELECT 1 FROM offer_promos WHERE asin=? AND seller_id=? AND message=?",
+        (asin, seller_id, message),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO offer_promos (asin, seller_id, message, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (asin, seller_id, message, ts, ts),
+        )
+        return True
+    conn.execute(
+        "UPDATE offer_promos SET last_seen=? WHERE asin=? AND seller_id=? AND message=?",
+        (ts, asin, seller_id, message),
+    )
+    return False
+
+
+def last_out_of_stock(conn: sqlite3.Connection, listing_id: str, now: str) -> str | None:
+    """ts of the listing's latest sold-out (in_stock=0) row before ``now``."""
+    row = conn.execute(
+        "SELECT MAX(ts) FROM observations WHERE listing_id=? AND in_stock=0 AND ts < ?",
+        (listing_id, now),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def threshold_alerts(conn: sqlite3.Connection, listing_id: str, triggers: tuple,
+                     since: str | None, now: str) -> list[tuple[str, float | None]]:
+    """(trigger, metric) of the price-threshold alerts sent for a listing after
+    ``since`` (its last sell-out; None = ever) and before ``now``."""
+    marks = ",".join("?" * len(triggers))
+    return [(r[0], r[1]) for r in conn.execute(
+        f"SELECT trigger, pv FROM alerts_sent WHERE listing_id=? AND trigger IN ({marks}) "
+        "AND (? IS NULL OR ts > ?) AND ts <= ?",
+        (listing_id, *triggers, since, since, now)).fetchall()]
+
+
+def out_of_stock_since(conn: sqlite3.Connection, listing_id: str, since_ts: str,
+                       now: str) -> bool:
+    """Was the listing stored as sold out after ``since_ts`` (its last alert)?
+    Then it came back, and its next appearance is a fresh opportunity."""
+    return conn.execute(
+        "SELECT 1 FROM observations WHERE listing_id=? AND in_stock=0 "
+        "AND ts > ? AND ts < ? LIMIT 1",
+        (listing_id, since_ts, now),
+    ).fetchone() is not None
+
+
+# Tables whose rows are updated in place (upserts): on a merge the row with the
+# newer last_seen wins, first_seen is the earliest, last_seen the latest, and
+# coupon_codes' sources are unioned. {table: primary-key columns}
+_UPSERTED = {
+    "coupon_codes": ("code",),
+    "offer_promos": ("asin", "seller_id", "message"),
+}
+
+
+def _merge_upserted(conn: sqlite3.Connection, table: str, key: tuple[str, ...],
+                    cols: list[str]) -> int:
+    where = " AND ".join(f"{k}=?" for k in key)
+    col_list = ", ".join(cols)
+    changed = 0
+    for src in conn.execute(f"SELECT {col_list} FROM src.{table}").fetchall():
+        theirs = dict(zip(cols, src))
+        row = conn.execute(f"SELECT {col_list} FROM main.{table} WHERE {where}",
+                           tuple(theirs[k] for k in key)).fetchone()
+        if row is None:
+            merged = theirs
+        else:
+            ours = dict(zip(cols, row))
+            newer = theirs if (theirs.get("last_seen") or "") > (ours.get("last_seen") or "") \
+                else ours
+            merged = dict(newer)
+            seen = [x for x in (ours.get("first_seen"), theirs.get("first_seen")) if x]
+            if seen:
+                merged["first_seen"] = min(seen)
+            last = [x for x in (ours.get("last_seen"), theirs.get("last_seen")) if x]
+            if last:
+                merged["last_seen"] = max(last)
+            if "sources" in merged:
+                parts = set((ours.get("sources") or "").split(",")) | \
+                    set((theirs.get("sources") or "").split(","))
+                merged["sources"] = ",".join(sorted(x for x in parts if x))
+            if merged == ours:
+                continue
+        conn.execute(f"INSERT OR REPLACE INTO main.{table} ({col_list}) "
+                     f"VALUES ({', '.join('?' * len(cols))})",
+                     tuple(merged[c] for c in cols))
+        changed += 1
+    return changed
+
+
+def merge_db_rows(src_path: Path, dst_path: Path) -> dict[str, int]:
+    """Copy the rows of the DB at ``src_path`` into ``dst_path``. Used by
+    gitsync when two watchers' snapshots of the binary DB conflict, so the
+    result loses nothing either side saw: append-only tables (observations,
+    alerts_sent, run_log, ...) take the rows ``dst`` lacks (INSERT OR IGNORE on
+    the primary key); upserted tables (``_UPSERTED``) keep the newer state of a
+    row both have. Columns are those both DBs share. Returns rows added or
+    updated per table."""
+    conn = connect(Path(dst_path))
+    try:
+        init_db(conn)
+        conn.execute("ATTACH DATABASE ? AS src", (str(src_path),))
+        added: dict[str, int] = {}
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM src.sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'")]
+        for t in tables:
+            dst_cols = [r[1] for r in conn.execute(f"PRAGMA main.table_info({t})")]
+            if not dst_cols:
+                continue
+            src_cols = {r[1] for r in conn.execute(f"PRAGMA src.table_info({t})")}
+            shared = [c for c in dst_cols if c in src_cols]
+            if t in _UPSERTED and all(k in shared for k in _UPSERTED[t]):
+                added[t] = _merge_upserted(conn, t, _UPSERTED[t], shared)
+                continue
+            cols = ", ".join(shared)
+            before = conn.total_changes
+            conn.execute(f"INSERT OR IGNORE INTO main.{t} ({cols}) SELECT {cols} FROM src.{t}")
+            added[t] = conn.total_changes - before
+        conn.commit()
+        conn.execute("DETACH DATABASE src")
+        return added
+    finally:
+        conn.close()
 
 
 def insert_run_log(conn: sqlite3.Connection, ts: str, polled: int, failures: int,
@@ -281,6 +497,26 @@ def pv_series(conn: sqlite3.Connection, seller: str, grade_rank: int,
         (seller, grade_rank, cutoff, now),
     )
     return [row["pv"] for row in cur.fetchall()]
+
+
+def current_offers(conn: sqlite3.Connection, venue: str | None = None,
+                   min_rank: int = 3, since: str | None = None) -> list[sqlite3.Row]:
+    """Latest snapshot of every in-stock listing at ``min_rank`` or better
+    (optionally one venue, and only listings seen at/after ``since``)."""
+    return conn.execute(
+        """
+        SELECT o.* FROM observations o
+        JOIN (
+            SELECT source_id, listing_id, MAX(ts) AS mts
+            FROM observations GROUP BY source_id, listing_id
+        ) latest
+        ON o.source_id=latest.source_id AND o.listing_id=latest.listing_id
+        AND o.ts=latest.mts
+        WHERE o.in_stock=1 AND o.grade_rank >= ? AND o.list_price IS NOT NULL
+          AND (? IS NULL OR o.venue = ?) AND (? IS NULL OR o.ts >= ?)
+        """,
+        (min_rank, venue, venue, since, since),
+    ).fetchall()
 
 
 def best_current_pv(conn: sqlite3.Connection, min_rank: int = 3,

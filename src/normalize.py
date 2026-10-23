@@ -1,4 +1,5 @@
-"""Grade normalization (spec §2) and present-value computation (spec §3)."""
+"""Grade normalization (spec §2), present-value computation (spec §3) and the
+12x card total the alerts are written in (``card_total``)."""
 from __future__ import annotations
 
 import re
@@ -6,7 +7,7 @@ import unicodedata
 
 from .models import Observation
 
-MIN_RANK = 3  # accept rank >= 3 (spec §2)
+MIN_RANK = 3  # accept rank >= 3 (spec §2); alerts use triggers.ALERT_MIN_RANK
 
 # Generic labels that mean "open box" regardless of seller -> rank 5 (spec §2).
 _GENERIC = [
@@ -94,6 +95,8 @@ def grade_rank(seller: str | None, grade_raw: str | None) -> int | None:
     g = _norm(grade_raw)
     if not g:
         return None
+    if g == "novo":       # a new unit (Amazon AOD heading "Novo") — not "Seminovo"
+        return 5
     for kw, rank in _GENERIC:
         if kw in g:
             return rank
@@ -115,14 +118,59 @@ def is_manual_review(seller: str | None, rank: int | None) -> bool:
     return _seller_key(seller) == "trocafy" and rank == 2
 
 
+def card_total(o: Observation) -> float | None:
+    """What the card/12x plan totals after confirmed coupons: list − coupon.
+
+    This is the number the user's alert thresholds are written in (they pay in
+    12x). The Pix/NuPay promo is deliberately absent — it only applies to a
+    one-off Pix payment, never to installments — while a coupon (Amazon-shown
+    or validated in the cart) comes off the order total and so off the plan.
+    """
+    if o.list_price is None:
+        return None
+    return round(o.list_price - (o.coupon or 0.0), 2)
+
+
+def pix_price(o: Observation) -> float | None:
+    """The one-off Pix price: list − the larger of the Pix promo and the coupon.
+
+    Amazon's Pix/NuPay promo "não pode ser combinada com outras ofertas": the
+    bigger discount applies, never both.
+    """
+    if o.list_price is None:
+        return None
+    return round(o.list_price - max(o.pix_discount or 0.0, o.coupon or 0.0), 2)
+
+
+def _pv_amazon(o: Observation, cdi_monthly: float) -> float | None:
+    """Amazon PV: Pix path with the no-stack rule (see ``pix_price``), or the
+    card total (list − coupon) spread evenly over the plan and discounted at
+    CDI. The plan is rebuilt from the card total instead of Amazon's
+    installment_value because a coupon lowers the installments too."""
+    cash = pix_price(o)
+    if cash is None:
+        return None
+    candidates = [cash - (o.cashback or 0.0)]
+    total = card_total(o)
+    if o.installments_n and total is not None:
+        per = total / o.installments_n
+        candidates.append(sum(per / (1 + cdi_monthly) ** k
+                              for k in range(1, o.installments_n + 1))
+                          - (o.cashback or 0.0))
+    return round(min(candidates), 2)
+
+
 def pv(o: Observation, cdi_monthly: float) -> float | None:
     """Present value in R$ today (spec §3).
 
     PIX path: list minus all instant discounts and cashback.
     Installment path (sem juros or com juros both discount the nominal stream
     at CDI): sum of installment values discounted per month, then cashback.
-    Return the cheaper of the two available paths.
+    Return the cheaper of the two available paths. Amazon has its own rules
+    (``_pv_amazon``): its Pix promo and coupons don't stack.
     """
+    if o.venue == "amazon":
+        return _pv_amazon(o, cdi_monthly)
     effective_pix = (
         (o.list_price or 0.0)
         - (o.pix_discount or 0.0)
@@ -161,13 +209,19 @@ CASHBACK_RATES: dict[str, list[tuple[str, float]]] = {}
 # --- Coupon extraction (spec §3 `coupon` field) -------------------------------
 # Gated on an explicit coupon word so a PIX "% de desconto" is never mistaken for
 # a coupon (which would double-count against pix_discount). Absolute R$ patterns
-# and coupon-scoped % patterns only.
-_COUPON_WORDS = ("cupom", "cupons", "economize")
+# and coupon-scoped % patterns only. "Insira o código X" is Amazon's wording for
+# a checkout code shown on the offer ("R$ 900 off. Insira o código SMART900").
+_COUPON_WORDS = ("cupom", "cupons", "economize", "codigo")
 _COUPON_ABS = [
     r"economize\s+r\$\s*([\d.,]+)",
     r"cupom[^r%]{0,25}r\$\s*([\d.,]+)",
     r"r\$\s*([\d.,]+)\s+de\s+desconto",
+    r"r\$\s*([\d.,]+)\s*off\b",
 ]
+# Terms that bound a coupon: a minimum order above the price voids it, a cap
+# limits a percentage ("10% (até R$ 100)").
+_COUPON_MIN = r"(?:acima\s+de|a\s+partir\s+de|minimo\s+de|compras\s+de)\s*r\$\s*([\d.,]+)"
+_COUPON_CAP = r"(?:ate|limitado\s+a|maximo\s+de)\s*r\$\s*([\d.,]+)"
 _COUPON_PCT = [
     r"cupom[^%]{0,25}?(\d{1,2})\s*%",   # non-greedy so "10%" isn't read as "0%"
     r"(\d{1,2})\s*%[^%]{0,25}cupom",
@@ -194,6 +248,9 @@ def coupon_from_text(text: str | None, list_price: float | None = None) -> float
     t = _norm(text)
     if not any(w in t for w in _COUPON_WORDS):
         return 0.0
+    m = re.search(_COUPON_MIN, t)
+    if m and list_price and (_brl_num(m.group(1)) or 0) > list_price:
+        return 0.0   # the order doesn't reach the coupon's minimum
     for pat in _COUPON_ABS:
         m = re.search(pat, t)
         if m:
@@ -204,7 +261,11 @@ def coupon_from_text(text: str | None, list_price: float | None = None) -> float
         for pat in _COUPON_PCT:
             m = re.search(pat, t)
             if m:
-                return round(list_price * int(m.group(1)) / 100, 2)
+                val = list_price * int(m.group(1)) / 100
+                cap = re.search(_COUPON_CAP, t)
+                if cap and _brl_num(cap.group(1)):
+                    val = min(val, _brl_num(cap.group(1)))
+                return round(val, 2)
     return 0.0
 
 

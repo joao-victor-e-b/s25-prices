@@ -1,10 +1,17 @@
+import re
 from pathlib import Path
 
 import pytest
 import requests
 
-from src.normalize import finalize, grade_rank
-from src.sources.amazon import AmazonSeminovosSource, aod_block_reason
+from src.normalize import card_total, finalize, grade_rank
+from src.sources.amazon import (
+    AmazonSeminovosSource,
+    aod_block_reason,
+    is_conditional_promo,
+    is_routine_promo,
+    parse_listing_id,
+)
 
 FIX = Path(__file__).parent / "fixtures"
 FIXTURE = FIX / "amazon_asin.html"      # Aug 2026 dp layout: no Pix promo
@@ -155,8 +162,9 @@ def test_aod_pix_path_pv():
     assert cs.pv == 4353.34                       # list - pix_discount
 
 
-def test_aod_offer_without_card_price_is_not_discounted():
-    # no add-to-cart (no card price) -> shown is taken as card, never guessed
+def test_aod_offer_without_card_price_rebuilds_card_from_pix_pct():
+    # no add-to-cart (no card price) under a 5% Pix promo: the shown price is the
+    # Pix price, so the card price is rebuilt from it (rounded up), not taken as is
     html = ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Preto</div>"
             "<div id='aod-offer'><div id='aod-offer-heading'>Seminovo - Aceitável</div>"
             "<span class='apex-pricetopay-accessibility-label'>R$ 3.723,05 com 5 por "
@@ -164,7 +172,7 @@ def test_aod_offer_without_card_price_is_not_discounted():
             "</span><div id='aod-offer-soldBy'><a href='/gp/aag/main?seller="
             "A3SPPFNXUZXE4P'>Assurant Ecophone</a></div></div>").encode()
     (o,) = _src().parse_aod(ASIN, html).offers
-    assert (o.list_price, o.pix_discount, o.in_stock) == (3723.05, 0.0, False)
+    assert (o.list_price, o.pix_discount, o.in_stock) == (3919.0, 195.95, False)
     assert o.listing_id == f"{ASIN}:A3SPPFNXUZXE4P:aceitavel"
 
 
@@ -340,8 +348,10 @@ def test_implausible_pix_gap_is_not_credited():
     assert (o.list_price, o.pix_discount) == (5000.0, 0.0)
 
 
-def test_pix_and_coupon_do_not_stack():
-    # Amazon applies the larger of the Pix promo and a coupon, never both
+def test_pix_and_coupon_are_kept_raw_and_do_not_stack_in_pv():
+    # Amazon applies the larger of the Pix promo and a coupon, never both. The
+    # scraper keeps both raw (the 12x total needs the coupon even when Pix is
+    # larger); normalize applies the no-stack rule.
     html = ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Preto</div>"
             "<div id='aod-offer'><div id='aod-offer-heading'>Seminovo - Excelente</div>"
             "<input name='submit.addToCart' aria-label='Adicionar ao carrinho do "
@@ -352,8 +362,11 @@ def test_pix_and_coupon_do_not_stack():
             "</div>").encode()
     src = _src()
     (o,) = src.combine(None, src.parse_aod(ASIN, html))
-    assert (o.pix_discount, o.coupon) == (210.0, 0.0)
-    assert finalize(o, 0.0088).pv == 3990.0
+    assert (o.pix_discount, o.coupon) == (210.0, 200.0)
+    assert finalize(o, 0.0088).pv == 3990.0       # 4200 - max(210, 200), not both
+    assert card_total(o) == 4000.0                # 12x: only the coupon counts
+    assert o.promos == ["à vista no Pix ou NuPay (5% off)",
+                        "Aplicar cupom: Economize R$ 200,00"]
 
 
 def test_amazon_own_offer_uses_its_merchant_id():
@@ -398,3 +411,459 @@ def test_complete_only_when_whole_panel_read(monkeypatch):
         (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes())),
     ])
     assert src.complete is False                         # page 2 failed
+
+
+# --- 512GB (second registry entry, ASIN B0FTMWWS8Y) ---------------------------
+
+ASIN_512 = "B0FTMWWS8Y"
+URL_512 = f"https://www.amazon.com.br/dp/{ASIN_512}"
+
+
+def _as_512(raw: bytes) -> bytes:
+    """The 256GB captures relabelled as the 512GB Titânio Preto product (no
+    real 512GB capture exists; the page layout is the same ASIN family)."""
+    out = raw.replace(b"S25 Ultra 5G, 256GB", b"S25 Ultra 5G, 512GB")
+    out = out.replace(ASIN.encode(), ASIN_512.encode())
+    assert out != raw
+    return out
+
+
+def _src_512():
+    return AmazonSeminovosSource(
+        {"id": "amazon_seminovos_512", "asin": ASIN_512, "url": URL_512,
+         "match": {"storage_gb": 512, "colors": ["preto", "jetblack"]}})
+
+
+def test_parse_buybox_512():
+    o = _src_512().parse(URL_512, _as_512(DP_PIX.read_bytes()))
+    assert o is not None
+    assert (o.storage_gb, o.color) == (512, "preto")
+    assert o.listing_id == f"{ASIN_512}:{CELLULAR}:excelente"
+    assert (o.list_price, o.pix_discount) == (4582.47, 229.13)
+    assert _src_512()._matches(o)
+
+
+def test_storage_filter_follows_the_configured_match():
+    # the 512 source rejects the 256 page and vice versa
+    assert _src_512().parse(URL, DP_PIX.read_bytes()) is None
+    assert _src().parse(URL_512, _as_512(DP_PIX.read_bytes())) is None
+    # RAM is not storage: "12GB RAM" never satisfies a 12GB/256GB match
+    html = b"<html><body><span id='productTitle'>Galaxy S25 Ultra 12GB RAM Preto</span>"
+    assert _src().parse(URL, html) is None
+
+
+def test_aod_512_offers_match_only_the_512_source():
+    page = _src_512().parse_aod(ASIN_512, _as_512(AOD.read_bytes()))
+    assert len(page.offers) == 3
+    assert all(o.storage_gb == 512 and o.listing_id.startswith(ASIN_512)
+               for o in page.offers)
+    assert all(_src_512()._matches(o) for o in page.offers)
+    assert not any(_src()._matches(o) for o in page.offers)
+
+
+def test_fetch_512_dp_plus_aod(monkeypatch):
+    src = _src_512()
+    src.pause_range = (0.0, 0.0)
+    routes = [("aodAjaxMain", _Resp(200, _as_512(AOD.read_bytes()))),
+              (f"/dp/{ASIN_512}", _Resp(200, _as_512(DP_PIX.read_bytes())))]
+
+    def get(url, headers=None, timeout=None):
+        return next(r for n, r in routes if n in url)
+
+    monkeypatch.setattr(src.session, "get", get)
+    obs = src.fetch()
+    assert len(obs) == 3 and src.complete
+    cs = next(o for o in obs if o.listing_id == f"{ASIN_512}:{CELLULAR}:excelente")
+    assert cs.installments_n == 12 and cs.storage_gb == 512
+
+
+def test_target_children_follow_the_configured_storage():
+    # the variation twister lists every child; each source deep-links its own
+    raw = DP_PIX.read_bytes()
+    assert _src_512()._target_children(raw) == [ASIN_512]
+    assert _src()._target_children(raw) == [ASIN]
+
+
+# --- promotion messages -------------------------------------------------------
+
+def test_aod_promos_captured_per_offer():
+    _, by_id = _aod_offers()
+    for o in by_id.values():
+        assert o.promos == ["à vista no Pix ou NuPay (5% off)"]
+
+
+def test_dp_promos_captured_and_merged_onto_pinned():
+    src = _src()
+    dp = src.parse(URL, DP_PIX.read_bytes())
+    assert any("Pix ou NuPay" in p for p in dp.promos)
+    page = src.parse_aod(ASIN, AOD.read_bytes())
+    combined = {o.listing_id: o for o in src.combine(dp, page)}
+    pinned = combined[f"{ASIN}:{CELLULAR}:excelente"]
+    assert set(dp.promos) <= set(pinned.promos)
+    # the no-promo dp layout has none
+    assert src.parse(URL, FIXTURE.read_bytes()).promos == []
+
+
+def test_dp_coupon_widget_is_a_promo():
+    html = (b"<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto"
+            b"</span><div id='corePrice_feature_div'><span class='a-price'>"
+            b"<span class='a-offscreen'>R$4.500,00</span></span></div>"
+            b"<div id='couponsInBuybox_feature_div'>"
+            b"Economize   R$ 250,00 com cupom</div></body></html>")
+    o = _src().parse(URL, html)
+    assert o.coupon == 250.0
+    assert o.promos == ["Economize R$ 250,00 com cupom"]   # whitespace squashed
+    assert not is_routine_promo(o.promos[0])
+
+
+def test_routine_promo_detection():
+    assert is_routine_promo("à vista no Pix ou NuPay (5% off)")
+    assert is_routine_promo("5% off à vista no Pix ou NuPay ou em até 12x de R$ 381,90/mês")
+    assert is_routine_promo("à vista no Pix (10% off)")
+    assert is_routine_promo("Em até 12x de R$ 381,90 sem juros")
+    assert not is_routine_promo("Aplicar cupom: Economize R$ 200,00")
+    assert not is_routine_promo("Economize 10% em 12x no cartão Amazon")
+    assert is_routine_promo("Frete GRÁTIS")                 # no discount at all
+    assert is_routine_promo("Oferta 90 dias de Amazon Music grátis incluso")
+    assert is_routine_promo("Economize R$ 229,13 no Pix")   # Pix-only, moves with price
+    assert not is_routine_promo("R$ 900 off. Insira o código SMART900")
+    assert is_routine_promo("")
+
+
+def test_parse_listing_id():
+    assert parse_listing_id(f"{ASIN}:{CELLULAR}:excelente") == (ASIN, CELLULAR)
+    assert parse_listing_id(f"{ASIN}:loja-x:bom") == (ASIN, "loja-x")
+    assert parse_listing_id("B0FTMQQ7L2") == ("B0FTMQQ7L2", "")
+
+
+# --- conditional Amazon-shown promos never feed the coupon -----------------------
+
+def _aod_with_promo(promo: str) -> bytes:
+    return ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Preto</div>"
+            "<div id='aod-offer'><div id='aod-offer-heading'>Seminovo - Excelente</div>"
+            "<input name='submit.addToCart' aria-label='Adicionar ao carrinho do "
+            "vendedor Loja X e preço R$ 4.000,00'>"
+            f"<div id='aod-offer-promotion-0'>{promo}</div></div>").encode()
+
+
+def test_card_first_purchase_coupon_is_announced_not_subtracted():
+    promo = "Aplicar cupom de R$ 200 na 1ª compra com cartão Amazon"
+    (o,) = _src().parse_aod(ASIN, _aod_with_promo(promo)).offers
+    assert o.coupon == 0.0
+    assert o.promos == [promo]                    # still reaches the 🏷️ alert
+    assert not is_routine_promo(promo)
+
+
+def test_prime_only_coupon_still_counts():
+    (o,) = _src().parse_aod(ASIN, _aod_with_promo(
+        "Aplicar cupom: Economize R$ 100,00 para membros Prime")).offers
+    assert o.coupon == 100.0
+
+
+def test_conditional_promo_detection():
+    for text in ("Economize R$ 50 com cupom pagando com Cartão Amazon",
+                 "cupom de 10% no cartão de crédito Itaú",
+                 "Aplicar cupom R$ 30 pagando com NuPay",
+                 "Cupom R$ 40 para clientes Nubank",
+                 "R$ 20 off com cupom na primeira compra",
+                 "Economize R$ 25 com cupom pelo App",
+                 "cupom de R$ 15 válido no aplicativo"):
+        assert is_conditional_promo(text), text
+    for text in ("Aplicar cupom: Economize R$ 200,00",
+                 "Cupom de R$ 100 para membros Prime",
+                 "Economize 10% em 12x no cartão de crédito",   # any card is fine
+                 ""):
+        assert not is_conditional_promo(text), text
+
+
+def test_dp_conditional_coupon_widget_is_not_subtracted():
+    html = ("<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto"
+            "</span><div id='corePrice_feature_div'><span class='a-price'>"
+            "<span class='a-offscreen'>R$4.500,00</span></span></div>"
+            "<div id='couponsInBuybox_feature_div'>Economize R$ 250,00 com cupom "
+            "na 1ª compra</div></body></html>").encode()
+    o = _src().parse(URL, html)
+    assert o.coupon == 0.0
+    assert o.promos == ["Economize R$ 250,00 com cupom na 1ª compra"]
+
+
+def test_promo_id_attached_to_its_message():
+    _, by_id = _aod_offers()
+    for o in by_id.values():
+        assert o.promo_ids == {"à vista no Pix ou NuPay (5% off)": "A3UQ0YQ0ADY6VN"}
+
+
+# --- review round 2: card price unknown under a Pix promo (C4) ------------------
+
+def _strip_card_price(raw: bytes) -> bytes:
+    out = re.sub(rb'<div class="[^"]*twister-plus-buying-options-price-data[^"]*">.*?</div>',
+                 b"", raw, flags=re.S)
+    out = re.sub(rb"total parcelado", b"total xxxxxxxxx", out, flags=re.I)
+    assert out != raw
+    return out
+
+
+def test_dp_without_card_price_rebuilds_it_from_the_12x_plan():
+    src = _src()
+    o = src.parse(URL, _strip_card_price(DP_PIX.read_bytes()))
+    assert o.list_price == 4582.80                  # 12 x 381,90: never the Pix 4353,34
+    assert o.pix_discount == round(4582.80 - 4353.34, 2)
+    assert any("card price missing" in n for n in src.notes)
+
+
+def test_dp_without_card_price_or_plan_rebuilds_it_from_the_pix_pct():
+    raw = _strip_card_price(DP_PIX.read_bytes())
+    raw = re.sub(rb"(\d+)x\s*(?:de\s*)?R\$", b"x R$", raw)   # no parsable plan either
+    o = _src().parse(URL, raw)
+    assert o.list_price == 4582.47                  # ceil(4353.34 / 0.95)
+    assert o.installments_n is None
+
+
+def test_aod_without_card_prices_rebuilds_them_from_the_pix_pct():
+    src = _src()
+    raw = AOD.read_bytes().replace("e preço R$".encode(), "e por R$".encode())
+    assert raw != AOD.read_bytes()
+    page = src.parse_aod(ASIN, raw)
+    prices = sorted(o.list_price for o in page.offers)
+    assert prices == [4582.47, 4582.47, 4839.0, 5099.0][-len(prices):]
+    assert 4353.34 not in prices                    # never the Pix price
+    assert page.complete and any("rebuilt" in n for n in src.notes)
+
+
+def test_aod_offer_whose_card_price_cant_be_rebuilt_is_dropped():
+    html = ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Preto</div>"
+            "<div id='aod-offer'><div id='aod-offer-heading'>Seminovo - Excelente</div>"
+            "<span class='apex-pricetopay-accessibility-label'>R$ 3.200,00</span>"
+            "<span id='promoMessage1'>à vista no Pix ou NuPay (20% off)</span>"
+            "<input name='submit.addToCart'></div>").encode()
+    src = _src()
+    page = src.parse_aod(ASIN, html)
+    assert page.offers == [] and page.complete is False   # never marks others sold out
+    assert any("without card price" in n for n in src.notes)
+
+
+# --- AOD for another product / storage, or without a title (C12) ----------------
+
+def test_sibling_storage_or_titleless_panel_is_never_complete(monkeypatch):
+    assert _src().parse_aod(ASIN, _as_512(AOD.read_bytes())).complete is False
+    no_title = AOD.read_bytes().replace(b'id="aod-asin-title-text"', b'id="gone"')
+    assert no_title != AOD.read_bytes()
+    assert _src().parse_aod(ASIN, no_title).complete is False
+    src, obs, _ = _fetch_src(monkeypatch, [
+        ("aodAjaxMain", _Resp(200, _as_512(AOD.read_bytes()))),
+        (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes())),
+    ])
+    assert src.complete is False and src.degraded   # no false sold-out marks
+    assert len(obs) == 1                            # just the dp buybox
+
+
+# --- real pushback vs an empty listing (C3) --------------------------------------
+
+def test_blocked_only_on_real_pushback(monkeypatch):
+    empty_panel = b"<html><body><div id='aod-container'></div></body></html>"
+    src, _, _ = _fetch_src(monkeypatch, [
+        ("aodAjaxMain", _Resp(200, empty_panel)),
+        (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes())),
+    ])
+    assert src.degraded and src.blocked is False    # sold-out listing: no backoff
+    src, _, _ = _fetch_src(monkeypatch, [
+        ("aodAjaxMain", _Resp(503, AOD_ERROR_BODY)),
+        (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes())),
+    ])
+    assert src.blocked is True
+    src, _, _ = _fetch_src(monkeypatch, [
+        ("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+        (f"/dp/{ASIN}", _Resp(200, CAPTCHA_BODY)),
+    ])
+    assert src.blocked is True
+    src, _, _ = _fetch_src(monkeypatch, [
+        ("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+        (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes())),
+    ])
+    assert src.blocked is False and src.degraded == []
+
+
+# --- promo items: split, de-duplicated, hidden text dropped, right ids (C11/C13/C14)
+
+def _aod_block(promo_html: str) -> bytes:
+    return ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Preto</div>"
+            "<div id='aod-offer'><div id='aod-offer-heading'>Seminovo - Excelente</div>"
+            "<input name='submit.addToCart' aria-label='Adicionar ao carrinho do "
+            "vendedor Loja X e preço R$ 4.000,00'>"
+            "<span class='apex-pricetopay-accessibility-label'>R$ 3.800,00</span>"
+            f"{promo_html}</div>").encode()
+
+
+PIX_ITEM = ("<span data-csa-c-item-id='amzn1.asin.X:amzn1.promotion.AAAAAAAAAA'>"
+            "<span id='promoMessage1'>à vista no Pix ou NuPay (5% off)</span></span>")
+
+
+def test_pix_line_and_coupon_in_one_block_are_separate_messages():
+    html = _aod_block("<div id='aod-offer-promotion-0'>" + PIX_ITEM +
+                      "<label id='couponText1'>Aplicar cupom: Economize R$ 200,00</label>"
+                      "</div>")
+    (o,) = _src().parse_aod(ASIN, html).offers
+    assert o.promos == ["à vista no Pix ou NuPay (5% off)",
+                        "Aplicar cupom: Economize R$ 200,00"]
+    assert o.coupon == 200.0 and o.pix_discount == 200.0     # NuPay no longer voids it
+    assert not is_routine_promo(o.promos[1])
+    # C14: the coupon has no id of its own and must not borrow the Pix item's
+    assert o.promo_ids == {"à vista no Pix ou NuPay (5% off)": "AAAAAAAAAA"}
+
+
+def test_one_promotion_is_one_message():
+    html = _aod_block(
+        "<div id='aod-offer-promotion-0'>"
+        "<span data-csa-c-item-id='amzn1.asin.X:amzn1.promotion.BBBBBBBBBB'>"
+        "<span class='a-text-bold'>R$10</span> <span id='promoMessage2'>off. Insira o "
+        "código CUPOMX na finalização da compra.</span> <a>Termos</a>"
+        "<span class='aok-hidden'>Cupom salvo!</span></span></div>")
+    (o,) = _src().parse_aod(ASIN, html).offers
+    assert o.promos == ["R$10 off. Insira o código CUPOMX na finalização da compra. Termos"]
+    assert o.promo_ids == {o.promos[0]: "BBBBBBBBBB"}
+    assert o.coupon == 10.0                                  # "Insira o código" counts
+    plain = _aod_block("<div id='aod-offer-promotion-0'><span id='promoMessage2'>"
+                       "Economize 5% em 2 item(ns) selecionado(s)</span> "
+                       "<a>Comprar itens</a> | <a>Termos</a></div>")
+    (o,) = _src().parse_aod(ASIN, plain).offers
+    assert o.promos == ["Economize 5% em 2 item(ns) selecionado(s)"]   # no duplicate
+
+
+def test_conditions_after_the_display_cut_still_count():
+    long = "Aplicar cupom: Economize R$ 300,00 " + "x" * 220 + " na 1ª compra"
+    (o,) = _src().parse_aod(ASIN, _aod_block(
+        f"<div id='aod-offer-promotion-0'>{long}</div>")).offers
+    assert o.coupon == 0.0 and len(o.promos[0]) == 200
+
+
+def test_payment_method_and_app_coupons_are_conditional():
+    for text in ("Aplicar cupom R$ 200 pagando com Pix",
+                 "Economize R$ 200,00 no pagamento via Pix",
+                 "Aplicar cupom de R$ 300 no boleto",
+                 "Cupom de R$ 150 para pagamento à vista",
+                 "Economize R$ 250 com cupom exclusivo do aplicativo",
+                 "5% off no Pix com o cupom PIX5"):
+        assert is_conditional_promo(text), text
+        (o,) = _src().parse_aod(ASIN, _aod_block(
+            f"<div id='aod-offer-promotion-0'>{text}</div>")).offers
+        assert o.coupon == 0.0, text
+
+
+# --- duplicate listings keep the lowest 12x total (C15) -------------------------
+
+def test_duplicate_listing_keeps_the_lowest_12x_total_and_the_plan():
+    from src.models import Observation
+    from src.sources.amazon import AodPage
+    base = dict(source_id="amazon_seminovos", seller="S", venue="amazon",
+                listing_id=f"{ASIN}:S:excelente", url="u", storage_gb=256, color="preto",
+                list_price=3640.0, pix_discount=182.0)
+    aod_copy = Observation(**base)
+    dp_copy = Observation(**base, coupon=150.0, installments_n=12, installment_value=303.34)
+    (o,) = _src().combine(dp_copy, AodPage(pinned=None, offers=[aod_copy]))
+    assert (o.coupon, o.installments_n) == (150.0, 12)
+    assert card_total(o) == 3490.0
+    # the dropped copy's plan survives on the kept one (same card price)
+    cheap = Observation(**base)
+    planned = Observation(**{**base, "pix_discount": 100.0}, installments_n=12,
+                          installment_value=303.34)
+    (o,) = _src().combine(None, AodPage(pinned=None, offers=[planned, cheap]))
+    assert o.pix_discount == 182.0 and o.installments_n == 12
+
+
+# --- new-unit listings (market study, Oct 2026) ------------------------------------
+
+AOD_NEW = FIX / "amazon_aod_new.html"   # B0DSYJCY45 offers panel, captured 2026-10-23
+
+
+def _src_new(**cfg):
+    return AmazonSeminovosSource({
+        "id": "amazon_novo_256_preto", "asin": "B0DSYJCY45", "default_grade": "Novo",
+        "match": {"storage_gb": 256, "colors": ["preto", "jetblack"]}, **cfg})
+
+
+def test_new_unit_panel_parses_novo_as_rank_5():
+    src = _src_new()
+    page = src.parse_aod("B0DSYJCY45", AOD_NEW.read_bytes())
+    assert page.complete and page.total == 5
+    offers = {o.listing_id: finalize(o, 0.0088) for o in src.combine(None, page)}
+    assert len(offers) == 5                          # Magalu's twin offer collapsed
+    amz = offers["B0DSYJCY45:A1ZZFT5FULY4LN:novo"]
+    assert (amz.seller, amz.grade_raw, amz.grade_rank) == ("Amazon.com.br", "Novo", 5)
+    assert (amz.list_price, amz.pix_discount) == (6043.49, 604.35)   # 10% Pix
+    casas = offers["B0DSYJCY45:A3CSZ2DZGY36JR:novo"]
+    assert casas.coupon == 0.0                       # COMPRANOAPP: 1st purchase + app
+    assert casas.promo_ids                          # its terms can be looked up
+
+
+def test_new_unit_dp_without_condition_uses_default_grade():
+    html = ("<html><body><span id='productTitle'>Celular Samsung Galaxy S25 Ultra 5G, "
+            "256GB, 12GB RAM, Titânio Preto</span>"
+            "<div class='twister-plus-buying-options-price-data'>"
+            '{"desktop_buybox_group_1":[{"priceAmount":6043.49}]}</div>'
+            "<span id='apex-pricetopay-accessibility-label'>R$ 5.439,14</span>"
+            "<div id='promotionMessageInsideBuyBox_feature_div'>10% off à vista no Pix "
+            "ou NuPay ou em até 12x de R$ 503,67/mês</div>"
+            "<div id='promoPriceBlockMessage_feature_div'>Oferta 90 dias de Amazon Music "
+            "grátis incluso</div><input id='merchantID' value='A1ZZFT5FULY4LN'>"
+            "<div id='availability'>Em estoque</div>"
+            "<span>em até 12x de R$ 503,67 sem juros</span></body></html>").encode()
+    o = finalize(_src_new().parse("https://www.amazon.com.br/dp/B0DSYJCY45", html), 0.0088)
+    assert (o.grade_raw, o.grade_rank) == ("Novo", 5)
+    assert (o.list_price, o.pix_discount) == (6043.49, 604.35)
+    assert (o.installments_n, o.installment_value) == (12, 503.67)
+    assert o.listing_id == "B0DSYJCY45:A1ZZFT5FULY4LN:novo"
+    assert all(is_routine_promo(p) for p in o.promos)   # Pix line + a freebie
+    assert _src().parse(URL, html).grade_raw is None   # seminovo sources: no default
+
+
+def test_used_like_new_on_a_new_listing_is_alertable():
+    html = ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Titânio Preto</div>"
+            "<div id='aod-offer'><div id='aod-offer-heading'>Usado - Como novo</div>"
+            "<input name='submit.addToCart' aria-label='Adicionar ao carrinho do "
+            "vendedor Amazon.com.br e preço R$ 4.633,00'></div>"
+            "<div id='aod-offer'><div id='aod-offer-heading'>Usado - Bom</div>"
+            "<input name='submit.addToCart' aria-label='Adicionar ao carrinho do "
+            "vendedor Loja e preço R$ 4.100,00'></div>").encode()
+    like_new, bom = (finalize(o, 0.0088) for o in
+                     _src_new().parse_aod("B0DSYJCY45", html).offers)
+    assert (like_new.grade_raw, like_new.grade_rank) == ("Como novo", 4)
+    assert bom.grade_rank == 2                      # below the alert rank
+
+
+def test_jet_black_titles_match():
+    from src.sources.amazon import _find_color
+    assert _find_color("Galaxy S25 Ultra 512GB Titânio Jet Black") == "jetblack"
+    assert _find_color("Galaxy S25 Ultra 512GB Titânio JetBlack") == "jetblack"
+
+
+def test_product_code_on_a_new_listing_counts_in_the_12x_total():
+    html = ("<div id='aod-asin-title-text'>Galaxy S25 Ultra 256GB Titânio Preto</div>"
+            "<div id='aod-offer'><div id='aod-offer-heading'>Novo</div>"
+            "<input name='submit.addToCart' aria-label='Adicionar ao carrinho do "
+            "vendedor Amazon.com.br e preço R$ 4.443,00'>"
+            "<div id='aod-offer-promotion-0'>R$ 900 off. Insira o código SMART900 na "
+            "finalização da compra.</div></div>").encode()
+    (o,) = _src_new().parse_aod("B0DSYJCY45", html).offers
+    assert o.coupon == 900.0 and card_total(o) == 3543.0
+
+
+def test_bank_wallet_and_multi_unit_coupons_are_conditional():   # A1
+    for text in ("Economize R$ 300 com cartões Santander",
+                 "Cupom de R$ 300 exclusivo para clientes Itaú",
+                 "Economize R$ 200 com Mercado Pago",
+                 "Economize R$ 250 com o cupom do Banco Inter",
+                 "Cupom R$ 100 pagando com PicPay",
+                 "Economize R$ 150 com cupom C6 Bank",
+                 "Economize R$ 300 ao comprar 2 itens",
+                 "Leve 2 e economize R$ 400 com cupom",
+                 "Cupom de 10% na compra de 3 unidades",
+                 "Economize 5% em 2 item(ns) selecionado(s)"):
+        assert is_conditional_promo(text), text
+        (o,) = _src().parse_aod(ASIN, _aod_block(
+            f"<div id='aod-offer-promotion-0'>{text}</div>")).offers
+        assert o.coupon == 0.0, text
+    for text in ("Aplicar cupom: Economize R$ 200,00",
+                 "Economize 10% em 12x no cartão de crédito",
+                 "Cupom de R$ 100 para membros Prime",
+                 "Compre 1 e economize R$ 50 com cupom"):
+        assert not is_conditional_promo(text), text

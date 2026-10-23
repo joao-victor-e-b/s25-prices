@@ -1,0 +1,38 @@
+name: heartbeat
+
+# Daily 09:00 BRT summary (best Amazon 12x total, a code worth testing, 24h
+# failures) read from the DB the watcher commits. Read-only: nothing is pushed.
+
+on:
+  schedule:
+    - cron: '0 12 * * *'   # 09:00 BRT (UTC-3)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s25-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CALLMEBOT_PHONE:  ${{ secrets.CALLMEBOT_PHONE }}
+      CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+      NTFY_TOPIC:       ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Heartbeat
+        run: python -m src.run --heartbeat

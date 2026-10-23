@@ -1,0 +1,31 @@
+# Codes tested in a logged-in amazon.com.br cart (Claude in Chrome or by hand).
+# A code is subtracted from the 12x total only while its latest check for that
+# ASIN+seller says it works and is at most MAX_AGE_DAYS old.
+#
+# One entry per test; append, don't edit old ones (the latest check wins):
+#   - code: CUPOMSEMPRE
+#     works: false
+#     checked: 2026-10-23          # date
+#     asin: B0FTMQQ7L2
+#     seller_id: A2TO0KKQTM1BAB    # or "*" when it worked for every seller tried
+#     cart_total: 4582.47          # item price in the cart when tested
+#     discount: 0.0                # R$ Amazon actually took off
+#     message: "texto exato que a Amazon mostrou"
+checks:
+  # 2026-10-23 — logged-in Prime account, cart = only B0FTMWWS8Y (512GB Titânio
+  # Preto, Seminovo - Excelente) from Assurant Ecophone at R$ 4.275,78
+  # (card 12x de R$ 356,37 sem juros). Codes typed in checkout's
+  # "Usar um cupom de desconto ou vale-presente" field; no order placed.
+  # Amazon locked further attempts after ~15 tries ("Você excedeu o máximo de
+  # tentativas permitidas. Tente novamente após 2 horas.").
+  - {code: OIPRIME15, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: CUPOMSEMPRE, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: 150FFCARTAO, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido não pode ser aplicado à esta compra.", note: "Amazon-shown promo: 15% off (até R$ 50) na 1ª compra com Cartão Amazon pedido após 12/10/2026"}
+  - {code: BORAPRIME, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: OIIPRIME10, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: CHEGOUPRIME, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: GROWTH, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: MEUPRIMEDAY, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  - {code: NET10, works: false, checked: 2026-10-23, asin: B0FTMWWS8Y, seller_id: A3SPPFNXUZXE4P, cart_total: 4275.78, discount: 0.0, message: "O cupom de desconto inserido é inválido."}
+  # Not concluded (rate limit hit mid-test): DIADECUPONS, AGOSTOCHEGOU, ALOCUPOM,
+  # CUPOM10, HORAPRIME, TIMEBR, SOMOSAMAZON, MEUCARTAOAMZ.

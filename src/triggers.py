@@ -1,8 +1,23 @@
-"""Alert triggers (spec §6) with 24h deduplication.
+"""Alert triggers (spec §6) with drop-based deduplication.
 
-All triggers except ``trocafy_review`` require grade_rank >= 3 and in_stock.
-Dedup: suppress a repeat (listing_id, trigger) within 24h unless PV moves
-more than R$100 (spec §6).
+Price thresholds are written in the number the user actually pays: the 12x
+card total after confirmed coupons (``normalize.card_total``), not PV — they
+buy in installments, where the Pix promo doesn't apply. A coupon only counts
+once confirmed (Amazon shows it on the offer, or a code was validated in the
+cart; see coupon_checks.py), so a threshold alert never rests on a guess.
+
+All triggers except ``trocafy_review`` require in_stock and grade_rank >=
+ALERT_MIN_RANK (4: Amazon's Premium/Excelente; Bom/Aceitável don't count).
+Dedup: the price thresholds (🔴/🟠/🟡) are one ladder per listing: a new
+threshold alert needs a 12x total at least DEDUP_DELTA_12X below the lowest
+one already sent for the listing since it was last stored sold out, unless it
+climbs into a stronger level than any sent; a rise never alerts. Other
+triggers repeat only on a DEDUP_PV_DELTA PV drop. A listing that sold out and
+came back starts fresh (single-unit refurb offers come and go).
+
+The multi-store triggers (new_low, grade_upgrade, venue_spread,
+trocafy_review) never apply to Amazon offers: in Amazon-only mode they would
+fire on months of other stores' history and on grade-2 offers.
 """
 from __future__ import annotations
 
@@ -10,19 +25,29 @@ from dataclasses import dataclass
 
 from . import store
 from .models import Observation
-from .normalize import MIN_RANK
+from .normalize import card_total
 
-# Price thresholds, calibrated Aug 2026 (spec §1). Re-calibrate PRIMARY monthly.
-INSTANT_BUY = 3500
-AGGRESSIVE = 3900
-PRIMARY = 4300
+# 12x card-total thresholds (R$), set by the user Oct 2026.
+BUY_NOW_12X = 3500    # 🔴 COMPRE
+GOOD_12X = 3800       # 🟠 bom preço
+YEAR_LOW_12X = 3919   # 🟡 beats the 2026 low (Assurant 256GB Excelente, 12x R$326,62)
 
-DEDUP_PV_DELTA = 100  # R$; the same (listing, trigger) only re-fires on a drop this big
+ALERT_MIN_RANK = 4    # Excelente/Premium and better (normalize.MIN_RANK stays 3)
+# A restock is only worth a ping near the user's range: new-unit listings carry
+# many sellers at R$ 6-10k that come and go (the old R$ 4.300 "primary" level).
+RESTOCK_MAX_12X = 4300
+
+DEDUP_PV_DELTA = 100   # R$; non-threshold triggers re-fire only on a PV drop this big
+DEDUP_DELTA_12X = 50   # R$; threshold triggers re-fire on a 12x-total drop this big
+
+THRESHOLD_TRIGGERS = ("instant_buy", "aggressive", "year_low")
+# Ladder strength: moving into a stronger level always alerts.
+_STRENGTH = {"year_low": 1, "aggressive": 2, "instant_buy": 3}
 
 PRIORITY = {
     "instant_buy": "🔴",
     "aggressive": "🟠",
-    "primary": "🟡",
+    "year_low": "🟡",
     "new_low": "🟡",
     "restock": "🟢",
     "venue_spread": "🟢",
@@ -37,6 +62,14 @@ class Alert:
     priority: str
     obs: Observation
     note: str = ""
+    # What the alert was judged on and what dedup compares/records: the 12x
+    # card total for thresholds, PV for everything else (filled in if unset).
+    metric: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.metric is None:
+            self.metric = (card_total(self.obs) if self.trigger in THRESHOLD_TRIGGERS
+                           else self.obs.pv)
 
 
 def _percentile(values: list[float], p: float) -> float | None:
@@ -51,21 +84,24 @@ def _percentile(values: list[float], p: float) -> float | None:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
-def _eligible(o: Observation) -> bool:
-    return bool(o.in_stock) and (o.grade_rank or 0) >= MIN_RANK
+def eligible(o: Observation) -> bool:
+    """In stock at an alertable grade (Excelente/Premium or better)."""
+    return bool(o.in_stock) and (o.grade_rank or 0) >= ALERT_MIN_RANK
 
 
 def _threshold_alert(o: Observation) -> Alert | None:
-    """Fire only the strongest matching price threshold to avoid triple alerts
-    for one listing (triggers 1-3 overlap by construction)."""
-    if o.pv is None:
+    """Fire only the strongest matching 12x threshold (they overlap by
+    construction: anything under BUY_NOW_12X is also under GOOD_12X and
+    YEAR_LOW_12X)."""
+    total = card_total(o)
+    if total is None:
         return None
-    if o.pv <= INSTANT_BUY:
-        return Alert("instant_buy", PRIORITY["instant_buy"], o)
-    if o.pv <= AGGRESSIVE:
-        return Alert("aggressive", PRIORITY["aggressive"], o)
-    if o.pv <= PRIMARY:
-        return Alert("primary", PRIORITY["primary"], o)
+    if total <= BUY_NOW_12X:
+        return Alert("instant_buy", PRIORITY["instant_buy"], o, metric=total)
+    if total <= GOOD_12X:
+        return Alert("aggressive", PRIORITY["aggressive"], o, metric=total)
+    if total <= YEAR_LOW_12X:
+        return Alert("year_low", PRIORITY["year_low"], o, metric=total)
     return None
 
 
@@ -76,17 +112,22 @@ def evaluate(conn, observations: list[Observation], now: str,
 
     # --- per-listing triggers ---
     for o in observations:
-        if _eligible(o):
-            # 1-3: strongest price threshold
+        if eligible(o):
+            # 1-2: strongest 12x threshold
             ta = _threshold_alert(o)
             if ta:
                 candidates.append(ta)
 
-            # 5: restock (in_stock flips false -> true)
+            # 5: restock (in_stock flips false -> true), near the user's range
             prev = store.last_observation(conn, o.source_id, o.listing_id, now)
-            if prev is not None and not prev["in_stock"]:
+            total = card_total(o)
+            if (prev is not None and not prev["in_stock"]
+                    and total is not None and total <= RESTOCK_MAX_12X):
                 candidates.append(Alert("restock", PRIORITY["restock"], o,
                                         "voltou ao estoque"))
+
+            if o.venue == "amazon":
+                continue   # the multi-store triggers below don't apply (module doc)
 
             # 4: new_low (gated until ~30 days of history exists)
             if enable_new_low and o.pv is not None:
@@ -106,33 +147,69 @@ def evaluate(conn, observations: list[Observation], now: str,
                                             o, f"grade 4 ≤ mediana grade 3 ({med:.0f})"))
 
         # 8: trocafy_review — rank-2 exception, manual review not auto-reject
-        if (o.manual_review and o.in_stock and o.pv is not None
-                and o.pv <= INSTANT_BUY):
+        total = card_total(o)
+        if (o.venue != "amazon" and o.manual_review and o.in_stock
+                and total is not None and total <= BUY_NOW_12X):
             candidates.append(Alert("trocafy_review", PRIORITY["trocafy_review"], o,
                                     "Trocafy rank-2 — revisar manualmente"))
 
     # --- cross-listing trigger 6: venue_spread ---
+    # Same seller + grade on *different* venues only: one venue can carry the
+    # same seller twice (Amazon's 256GB and 512GB listings), which is no spread.
     groups: dict[tuple, list[Observation]] = {}
     for o in observations:
-        if _eligible(o) and o.pv is not None:
+        if eligible(o) and o.pv is not None and o.venue != "amazon":
             groups.setdefault((o.seller, o.grade_rank), []).append(o)
     for _key, offers in groups.items():
-        if len(offers) < 2:
-            continue
         lo = min(offers, key=lambda x: x.pv)
-        hi = max(offers, key=lambda x: x.pv)
+        elsewhere = [x for x in offers if x.venue != lo.venue]
+        if not elsewhere:
+            continue
+        hi = max(elsewhere, key=lambda x: x.pv)
         if hi.pv - lo.pv >= 200:
             candidates.append(Alert("venue_spread", PRIORITY["venue_spread"], lo,
                                     f"spread R$ {hi.pv - lo.pv:.0f} vs {hi.venue}"))
 
-    return _dedup(conn, candidates, now)
+    return _dedup(conn, _fold_restock(candidates), now)
+
+
+def _fold_restock(candidates: list[Alert]) -> list[Alert]:
+    """A listing that returns at a COMPRE/BOM PREÇO price gets one message: the
+    threshold alert, noted "voltou ao estoque", instead of two."""
+    threshold = {a.obs.listing_id: a for a in candidates if a.trigger in THRESHOLD_TRIGGERS}
+    kept = []
+    for a in candidates:
+        t = threshold.get(a.obs.listing_id)
+        if a.trigger == "restock" and t is not None:
+            t.note = f"{t.note}; {a.note}" if t.note else a.note
+            continue
+        kept.append(a)
+    return kept
+
+
+def _threshold_repeat(conn, a: Alert, now: str) -> bool:
+    """Is this threshold alert a repeat? Compared against every threshold alert
+    sent for the listing since it was last stored sold out: it passes only
+    with a 12x total DEDUP_DELTA_12X below the lowest of them, or when its
+    level is stronger than any of them (🟡 -> 🟠 -> 🔴). A rise to a weaker
+    level (🔴 3.499 -> 🟠 3.700) is never news."""
+    since = store.last_out_of_stock(conn, a.obs.listing_id, now)
+    priors = store.threshold_alerts(conn, a.obs.listing_id, THRESHOLD_TRIGGERS, since, now)
+    if not priors:
+        return False
+    if _STRENGTH[a.trigger] > max(_STRENGTH.get(t, 0) for t, _ in priors):
+        return False
+    values = [v for _, v in priors if v is not None]
+    if not values or a.metric is None:
+        return True   # can't confirm a drop -> suppress
+    return a.metric > min(values) - DEDUP_DELTA_12X
 
 
 def _dedup(conn, candidates: list[Alert], now: str) -> list[Alert]:
-    """Suppress a repeat (listing_id, trigger) unless the PV has dropped by at
-    least DEDUP_PV_DELTA since it was last alerted. No time window — a rise or a
-    repeat at the same price never re-fires; only a genuine drop does. Crossing
-    into a stronger threshold still fires (it's a different trigger key)."""
+    """Suppress repeats. Thresholds: see ``_threshold_repeat``. Others: a
+    repeat (listing_id, trigger) fires only after a DEDUP_PV_DELTA PV drop. No
+    time window — a rise or a repeat at the same price never re-fires — but a
+    listing stored as sold out since its last alert starts fresh."""
     kept: list[Alert] = []
     seen_this_cycle: set[tuple] = set()
     for a in candidates:
@@ -141,13 +218,21 @@ def _dedup(conn, candidates: list[Alert], now: str) -> list[Alert]:
             continue
         seen_this_cycle.add(key)
 
+        if a.trigger in THRESHOLD_TRIGGERS:
+            if not _threshold_repeat(conn, a, now):
+                kept.append(a)
+            continue
+
         prior = store.last_alert(conn, a.obs.listing_id, a.trigger,
                                  within_hours=None, now=now)
+        if prior is not None and store.out_of_stock_since(conn, a.obs.listing_id,
+                                                          prior["ts"], now):
+            prior = None   # sold out since the last alert -> a fresh opportunity
         if prior is not None:
-            prior_pv = prior["pv"]
-            if prior_pv is None or a.obs.pv is None:
+            prior_value = prior["pv"]
+            if prior_value is None or a.metric is None:
                 continue  # can't confirm a drop -> suppress repeat
-            if a.obs.pv > prior_pv - DEDUP_PV_DELTA:
-                continue  # not a >=R$100 drop -> suppress repeat
+            if a.metric > prior_value - DEDUP_PV_DELTA:
+                continue  # not a big enough drop -> suppress repeat
         kept.append(a)
     return kept

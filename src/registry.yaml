@@ -6,9 +6,15 @@
 #   id      unique source_id (matches schema)
 #   seller  who actually ships
 #   venue   own_site | magalu | amazon | ml | americanas
-#   tier    1 (hourly), 2 (hourly, arbitrage), 3 (daily)
+#   tier    1 and 2 every poll (2 = arbitrage), 3 only with --daily
 #   url     listing/category URL
 #   module  scraper module name (null until implemented)
+#   enabled false = skipped by poll and heartbeat (config kept for later)
+#   every   N = poll on every Nth loop iteration only (default 1)
+#   default_grade  condition for a buybox that names none (new units: Novo)
+#
+# Amazon-only mode (Oct 2026): the user buys on amazon.com.br in 12x, so every
+# other source is disabled. Flip `enabled` back (or delete the line) to revive one.
 
 sources:
   # --- Tier 1: confirmed to stock SM-S938B 256GB ---
@@ -16,6 +22,7 @@ sources:
     seller: Trocafy
     venue: own_site
     tier: 1
+    enabled: false
     url: https://www.trocafy.com.br/smartphone/samsung/galaxy-s25-ultra/
     module: trocafy          # price leader, cleanest target
     notes: iSET platform; category server-rendered with prices in HTML
@@ -27,6 +34,7 @@ sources:
     seller: Trocafone
     venue: own_site
     tier: 1
+    enabled: false
     url: https://www.trocafone.com.br/samsung-galaxy-s25-ultra-256gb/p
     module: trocafone        # VTEX public catalog API — cleanest source
     notes: VTEX; scraper hits /api/catalog_system/pub/products/search
@@ -38,6 +46,7 @@ sources:
     seller: Outlet do Celular
     venue: own_site
     tier: 1
+    enabled: false
     url: https://www.outletdocelular.com.br/celular-samsung/s25-ultra
     category_url: https://www.outletdocelular.com.br/celular-samsung/s25-ultra
     module: outletdocelular  # Tray; category -> per-product JSON-LD + price box
@@ -58,10 +67,23 @@ sources:
       storage_gb: 256
       colors: [preto, jetblack]
 
+  - id: amazon_seminovos_512
+    seller: Amazon Seminovos
+    venue: amazon
+    tier: 1
+    url: https://www.amazon.com.br/dp/B0FTMWWS8Y
+    asin: B0FTMWWS8Y
+    module: amazon           # same scraper; 512GB Titânio Preto child of the family
+    notes: same ASIN family as B0FTMQQ7L2; separate product page + offers panel
+    match:
+      storage_gb: 512
+      colors: [preto, jetblack]
+
   - id: mercadolivre_recond
     seller: Mercado Livre
     venue: ml
     tier: 1
+    enabled: false
     url: https://lista.mercadolivre.com.br/samsung-galaxy-s25-ultra-256gb_recondicionado
     module: null
     notes: prefer "recondicionado pela marca" (1yr warranty)
@@ -71,6 +93,7 @@ sources:
     seller: Trocafone
     venue: magalu
     tier: 2
+    enabled: false
     url: https://www.magazineluiza.com.br/
     module: null
 
@@ -78,6 +101,7 @@ sources:
     seller: Trocafy
     venue: magalu
     tier: 2
+    enabled: false
     url: https://www.magazineluiza.com.br/
     module: null
 
@@ -85,6 +109,7 @@ sources:
     seller: Trocafone
     venue: ml
     tier: 2
+    enabled: false
     url: https://www.mercadolivre.com.br/
     module: null
 
@@ -92,6 +117,7 @@ sources:
     seller: Trocafy
     venue: ml
     tier: 2
+    enabled: false
     url: https://www.mercadolivre.com.br/
     module: null
 
@@ -99,6 +125,7 @@ sources:
     seller: Americanas
     venue: americanas
     tier: 2
+    enabled: false
     url: https://www.americanas.com.br/busca/galaxy-s25-ultra-256gb
     search_url: https://www.americanas.com.br/busca/galaxy-s25-ultra-256gb
     module: americanas        # Playwright-rendered; captures "Usado:" refurb listings
@@ -112,5 +139,68 @@ sources:
     seller: Samsung BR
     venue: own_site
     tier: 3
+    enabled: false
     url: https://www.samsung.com/br/shop/
     module: null
+
+  # --- Amazon NEW units (Oct 2026 market study: a new black 256GB sold at
+  # R$ 3.543 with coupon SMART900 on 2026-10-08, and Amazon Quase Novo puts
+  # "Usado - Como novo" units on the new listing). AOD headings: "Novo" ->
+  # rank 5, "Usado - Como novo" -> 4; the dp names no condition, hence
+  # default_grade. `every: 2` polls them on every 2nd loop iteration so one
+  # poll stays at <= 6 ASINs x 2 requests.
+  - id: amazon_novo_256_preto
+    seller: Amazon
+    venue: amazon
+    tier: 1
+    every: 2
+    url: https://www.amazon.com.br/dp/B0DSYJCY45
+    asin: B0DSYJCY45
+    module: amazon
+    default_grade: Novo
+    notes: new 256GB Titânio Preto
+    match:
+      storage_gb: 256
+      colors: [preto, jetblack]
+
+  - id: amazon_novo_256_jetblack
+    seller: Amazon
+    venue: amazon
+    tier: 1
+    every: 2
+    url: https://www.amazon.com.br/dp/B0F1HDQSQG
+    asin: B0F1HDQSQG
+    module: amazon
+    default_grade: Novo
+    notes: new 256GB Titânio JetBlack
+    match:
+      storage_gb: 256
+      colors: [preto, jetblack]
+
+  - id: amazon_novo_512_preto
+    seller: Amazon
+    venue: amazon
+    tier: 1
+    every: 2
+    url: https://www.amazon.com.br/dp/B0DSXZ4FZT
+    asin: B0DSXZ4FZT
+    module: amazon
+    default_grade: Novo
+    notes: new 512GB Titânio Preto
+    match:
+      storage_gb: 512
+      colors: [preto, jetblack]
+
+  - id: amazon_novo_512_jetblack
+    seller: Amazon
+    venue: amazon
+    tier: 1
+    every: 2
+    url: https://www.amazon.com.br/dp/B0DTMCLTKV
+    asin: B0DTMCLTKV
+    module: amazon
+    default_grade: Novo
+    notes: new 512GB Titânio JetBlack
+    match:
+      storage_gb: 512
+      colors: [preto, jetblack]

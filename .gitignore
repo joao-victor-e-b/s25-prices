@@ -23,3 +23,7 @@ data/*.db-shm
 
 # Claude Code local state
 .claude/scheduled_tasks.lock
+
+# Deep-research notes and reports (local only)
+research_notes/
+reports/
