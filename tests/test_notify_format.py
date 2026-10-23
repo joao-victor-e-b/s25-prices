@@ -100,3 +100,55 @@ def test_heartbeat_shows_validated_coupon():
     msg = format_heartbeat(o, None, 2, tot)
     assert "12x de R$ 298,33 (total R$ 3.580,00)" in msg
     assert "c/ cupom CUPOMX −R$ 120,00 (validado)" in msg
+
+
+# --- 🔍 unseen offer + the heartbeat's offers line ----------------------------------
+
+from src.models import OfferSummary   # noqa: E402
+from src.notify import format_unseen_offer   # noqa: E402
+from src.triggers import UnseenOfferAlert   # noqa: E402
+
+
+def _unseen(price=3700.0, shipping=13.22, scope="ALL", level="aggressive", **kw):
+    s = OfferSummary(asin="B0FTMWWS8Y", offers_total=4, min_card_price=price,
+                     min_shipping=shipping, scope=scope, storage_gb=512, color="preto")
+    total = s.min_total
+    return UnseenOfferAlert(s, level, total, **kw)
+
+
+def test_unseen_offer_format():
+    msg = format_unseen_offer(_unseen(attributed=2, attributed_min=4149.0))
+    lines = msg.split("\n")
+    assert lines[0] == ("🔍 Amazon 512GB preto: oferta a partir de R$ 3.713,22 "
+                        "(12x ≈ R$ 309,44) — vendedor/condição não visíveis do "
+                        "servidor, confira")
+    assert lines[1] == ("nível 🟠 BOM PREÇO · R$ 3.700,00 + R$ 13,22 de envio · "
+                        "4 ofertas, 2 identificadas (menor R$ 4.149,00)")
+    assert lines[2] == "https://www.amazon.com.br/dp/B0FTMWWS8Y"
+    assert not re.search(r"\$\d", msg)
+    assert len(msg) < 500                                 # one WhatsApp batch
+
+
+def test_unseen_offer_format_free_shipping_nothing_seen_new_unit():
+    msg = format_unseen_offer(_unseen(3480.0, 0.0, scope="NEW", level="instant_buy"))
+    lines = msg.split("\n")
+    assert lines[0].startswith("🔍 Amazon 512GB preto novo: oferta a partir de R$ 3.480,00 "
+                               "(12x ≈ R$ 290,00)")
+    assert lines[1] == "nível 🔴 COMPRE · 4 ofertas, 0 identificadas"
+    assert "🟡 ABAIXO DO MÍNIMO DE 2026" in format_unseen_offer(_unseen(3900.0, None,
+                                                                       level="year_low"))
+
+
+def test_heartbeat_offers_line():
+    o = _amazon(list_price=4582.47, pix_discount=229.13, installments_n=12,
+                installment_value=381.90)
+    tot = {"runs": 1, "failures": 0, "partial": 0, "coupon_errors": 0}
+    msg = format_heartbeat(o, None, 6, tot,
+                           offers=[("256GB", 3, 4582.47), ("512GB", 4, 4149.0),
+                                   ("512GB", 2, None)])
+    lines = msg.split("\n")
+    assert lines[2] == ("Ofertas: 256GB 3 (menor R$ 4.582,47) · 512GB 4 (menor R$ 4.149,00)"
+                        " · 512GB 2")
+    assert lines[3].startswith("24h:")
+    assert "Ofertas" not in format_heartbeat(o, None, 6, tot, offers=[])
+    assert not re.search(r"\$\d", msg)

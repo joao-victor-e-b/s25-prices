@@ -17,6 +17,7 @@ retailers; since Oct 2026 it runs in **Amazon-only mode** (see below).
 | 🔴 **COMPRE** | 12x total ≤ **R$ 3.500** (`triggers.BUY_NOW_12X`) |
 | 🟠 **BOM PREÇO** | 12x total ≤ **R$ 3.800** (`triggers.GOOD_12X`) |
 | 🟡 **ABAIXO DO MÍNIMO DE 2026** | 12x total ≤ **R$ 3.919** (`triggers.YEAR_LOW_12X`) — beats the 2026 low (Assurant 256GB, 12x R$ 326,62, Oct 10–19) |
+| 🔍 **Oferta não visível do servidor** | the product page's "Comparar outras N ofertas a partir de R$ X (+R$ Y de envio)" line puts the cheapest offer (X + Y) at ≤ **R$ 3.919**, and more than R$ 1 below every offer we know for that ASIN: the ones this poll attributed (any seller, grade or stock state) plus those stored in stock in the last 2 h (`triggers.UNSEEN_KNOWN_HOURS`) — so the buybox, an offer that just rotated out of it, or a known Aceitável unit the panel named a poll ago never re-alerts as 🔍. Seller and condition are unknown, so it says "confira" and names the level it would reach (🔴 ≤ 3.500 / 🟠 ≤ 3.800 / 🟡 ≤ 3.919). See [CI limitation](#ci-limitation-the-offers-panel) |
 | 🏷️ Nova promoção Amazon | Amazon starts showing a discount message on an eligible offer whose 12x total is ≤ R$ 4.300, or that the message's stated amount would take to ≤ R$ 3.919 (never the everyday "à vista no Pix ou NuPay (5% off)" line) — once per offer + message, one alert per ASIN for all sellers showing it |
 | 🎟️ Cupom Amazon | an aggregator lists a new checkout code worth ≥ R$ 100 at the current price — marked **"não validado"** |
 | 💸 Cashback | an Amazon cashback portal turns on |
@@ -38,6 +39,14 @@ retailers; since Oct 2026 it runs in **Amazon-only mode** (see below).
   review) never apply to Amazon offers.
   Delivery is counted per WhatsApp-sized batch: an alert is marked sent only
   once its batch reached at least one channel.
+- 🔍 has the same ladder, per ASIN (`alerts_sent.listing_id = unseen:<ASIN>`,
+  metric = X + Y): a rise never alerts, a R$ 50 drop or a stronger level
+  re-fires, and it starts fresh only once a stored reading shows an offer
+  *left* (`store.last_offer_departure`, the analogue of a sell-out): the
+  product page lost its line (only the buybox was left), or the line's count
+  fell with nothing ≤ R$ 3.919 left. A price bouncing across R$ 3.919 at the
+  same count (3.915 → 3.925 → 3.915) is a reprice and alerts once. Also
+  recorded only after delivery; `--dry-run` prints it and records nothing.
 
 Example:
 
@@ -48,6 +57,10 @@ c/ cupom CUPOMX −R$ 200,00 (validado)
 Pix à vista R$ 3.500,00
 Assurant Ecophone · Excelente
 https://www.amazon.com.br/dp/B0FTMWWS8Y?smid=A3SPPFNXUZXE4P
+
+🔍 Amazon 512GB preto: oferta a partir de R$ 3.713,22 (12x ≈ R$ 309,44) — vendedor/condição não visíveis do servidor, confira
+nível 🟠 BOM PREÇO · R$ 3.700,00 + R$ 13,22 de envio · 4 ofertas, 2 identificadas (menor R$ 4.149,00)
+https://www.amazon.com.br/dp/B0FTMWWS8Y
 ```
 
 ## Coupons: only confirmed ones lower the 12x total
@@ -123,10 +136,11 @@ Rules (`src/coupon_checks.py`):
   R$ 3.543 with SMART900 in Oct 2026, and "Amazon Quase Novo — Usado - Como
   novo" units sit on the new listings): `B0DSYJCY45` (256GB Preto),
   `B0F1HDQSQG` (256GB JetBlack), `B0DSXZ4FZT` (512GB Preto), `B0DTMCLTKV`
-  (512GB JetBlack), with `every: 2` (every 2nd iteration, so a poll fetches
+  (512GB JetBlack), with `every: 3` (every 3rd iteration, so a poll fetches
   at most 6 ASINs) and `default_grade: Novo` (their product page names no
-  condition). Each poll reads the product page and the "Comparar outras
-  ofertas" panel and stores one row per seller + grade (`listing_id =
+  condition). Each poll reads the product page (buybox, 12x plan, promos and
+  the "Comparar outras N ofertas" line) and tries the "Comparar outras
+  ofertas" panel once, storing one row per seller + grade (`listing_id =
   asin:seller_id:grade`); the cheapest is often *not* the buybox. A seller
   that vanishes from a fully-read panel is stored as sold out, so its return
   can alert again; a panel for another storage, without a title, or with an
@@ -146,6 +160,58 @@ Rules (`src/coupon_checks.py`):
   (`/promotion/tnc/<id>`) when Amazon exposes the promotion id.
 - **Cashback.** All Amazon cashback portals have been at 0% since Apr 2026;
   the coupon sweep records their rate and pings 💸 when one turns on.
+
+## CI limitation: the offers panel
+
+From GitHub Actions IPs Amazon answers the All Offers panel with HTTP 503
+most of the time — two CI diagnostic runs (Oct 2026) got it for **every**
+variant: `aodAjaxMain`, `/gp/aod/ajax`, full Chrome-141 client hints +
+`sec-fetch` cors headers, cold/warm/mobile sessions, `/gp/offer-listing`,
+repeated retries; the live watcher gets it on and off — while `/dp/` product
+pages always load. `/dp/<ASIN>?smid=<seller>&psc=1` does not switch the
+buybox from CI either, so per-seller pages are no way round. On a poll
+without the panel, then, only the **buybox** seller can be named (locally,
+from a home IP, the panel usually works and every seller is stored).
+
+What still loads is the product page's other-offers line
+(`#aod-ingress-link`):
+
+> Comparar outras 3 ofertas a partir de R$4.582,47 · +R$ 13,22 de envio
+
+`amazon.parse_ingress` reads it on every product page into
+`models.OfferSummary`: `offers_total` (every offer on the ASIN, **buybox
+included**), `min_card_price` (the lowest *card* price among them),
+`min_shipping` (`+R$ X de envio`; GRÁTIS = 0) and `scope` (`ALL`, or `NEW` on
+the new-unit pages: the link's `condition=`, or its `dp_olp_<SCOPE>_mbc` ref
+token when it has none; anything but ALL/NEW/USED is stored as NULL). It is
+not an observation — no seller, no grade — so it never drives 🔴/🟠/🟡.
+
+A listing whose only offer is the buybox shows **no** line (single-offer
+new-unit pages, Oct 2026). When our ASIN's page loads with a priced buybox
+and the slot the line lives in (`#olpLinkWidget_feature_div`) but no line, a
+**no-line marker** is recorded instead: `scope = NONE`, 1 offer at the
+buybox's card price (0 when it is unavailable). A blocked or captcha page,
+another variation's page, a page without the slot or without a buybox price
+never writes one; it doesn't count in `ingress=k/m` either. Then:
+
+- `offer_summary` stores lines and markers per ASIN (on change + hourly
+  keepalive, like observations; merged append-only by gitsync). On
+  2026-10-23 CI read B0FTMQQ7L2 with 3 offers and B0FTMWWS8Y with 4, while
+  only 2 sellers were attributable.
+- a rising `offers_total` is noted in the poll's `run_log.detail` (`<ASIN>
+  offers 2->4 from 4149.00`; a marker compares with any scope, so a line
+  appearing next to a lone buybox reads `1->2`), with no alert: a new seller
+  says nothing about price by itself;
+- 🔍 fires when the line's cheapest offer is within the 2026 low and below
+  every known offer (see the alerts table); a marker never fires, and resets
+  the 🔍 ladder (the hidden offer left);
+- the daily heartbeat adds `Ofertas: 256GB N (menor R$ X) · 512GB N (menor
+  R$ Y)` from the latest reading of each seminovo listing (last 48h; a
+  marker shows as `1`, so a vanished line isn't reported for two more days;
+  new-unit listings — `default_grade: Novo` — are left out).
+
+Each poll therefore costs one product page + one panel try per due ASIN; a
+blocked panel is not retried and does not slow the loop down (see Cadence).
 
 ## Amazon-only mode
 
@@ -172,21 +238,22 @@ python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800 --git-
 - polls every **~4 min** (240 s ± 20% jitter) for 5h45, stopping before the
   budget runs out; `every: N` sources only on every Nth poll (the four
   new-unit ASINs: every 3rd);
-- Amazon rate-limits bursts from CI IPs (the offers panel got HTTP 503 at
-  6 ASINs × 2 requests a minute), so every Amazon request in the process —
-  all sources and promotion-terms lookups — goes through one pacer
+- Amazon rate-limits bursts from CI IPs, so every Amazon request in the
+  process — all sources and promotion-terms lookups — goes through one pacer
   (`amazon.AMAZON_MIN_GAP_S` = 10 s ± 30% apart) on one shared session. Per
-  ASIN the offers panel comes first (its add-to-cart labels carry the card
-  prices the 12x total needs); the product page only on a cold session,
-  every `dp_every` (4th) poll of the source, every poll while it shows a
-  coupon, or as the fallback when the panel fails — in between, its last
-  installment plan/promos are reused at an unchanged buybox price. A blocked
-  panel is retried once after ~45 s before falling back to the product page;
-- backoff: hard pushback (a source raised, product page blocked/captcha)
-  doubles the sleep up to 20 min; soft (only the offers panel blocked) grows
-  it ×1.5 up to 12 min; a clean poll resets it — an empty (sold-out) listing
-  is not pushback. Each poll logs `[amazon] requests=N aod_ok=x/y` and
-  starts its `run_log.detail` with `aod_ok=x/y req=N`;
+  due ASIN and poll: the product page first (buybox, 12x plan, promos and the
+  other-offers line — everything CI can get), then **one** try at the offers
+  panel (every seller's card price, when Amazon serves it). A blocked panel
+  is not retried: from CI it is always blocked ([CI
+  limitation](#ci-limitation-the-offers-panel));
+- backoff: only real pushback (a source raised, product page
+  blocked/captcha) doubles the sleep, up to 20 min; a poll without it resets
+  to the interval. A blocked or empty offers panel next to a good product
+  page is not pushback — it is CI's steady state, and backing off on it used
+  to stretch every poll to 12–17 min. Each poll logs `[amazon] requests=N
+  aod_ok=x/y ingress=k/m` and starts its `run_log.detail` with `aod_ok=x/y
+  req=N ingress=k/m` (k of m product pages showed the other-offers line);
+  the panel's failures still count as partial fetches there;
 - the coupon/cashback sweep runs on the first poll and then every 30 min; the
   DuckDuckGo deal scan is off in loop mode; CDI is fetched once per loop;
 - `--git-sync` pulls before the first poll (a queued run's checkout predates
@@ -213,8 +280,11 @@ runs: `mode` = `watch` | `dry` (one poll, no messages) | `test` (test alert);
 dry and test runs get their own group, so they run at once and never displace
 the watcher. `.github/workflows/heartbeat.yml` sends the
 daily 09:00 BRT heartbeat: best eligible offer as "12x de R$ X (total R$ Y)"
-(seller, storage, coupon) and Pix price, the best untested codes worth
-≥ R$ 100, and the last 24h of polls/failures from `run_log`. The heartbeat
+(seller, storage, coupon) and Pix price, the other-offers line of the
+seminovo listings (`Ofertas: 256GB N (menor R$ X) · 512GB N (menor R$ Y)`,
+skipped when `offer_summary` has nothing from the last 48h), the best
+untested codes worth ≥ R$ 100, and the last 24h of polls/failures from
+`run_log`. The heartbeat
 job fails (exit 1) when neither channel delivered, so a dead secret or relay
 shows up as a red run and a GitHub email.
 
@@ -226,7 +296,7 @@ shows up as a red run and a GitHub email.
 src/
   sources/                   one module per source (amazon.py is the live one)
   registry.yaml              source config — add a seller = edit this file
-  models.py                  Observation dataclass (maps to schema)
+  models.py                  Observation (maps to schema) + OfferSummary (offers line)
   normalize.py               grade ranks, 12x card total, Pix price, PV
   coupon_checks.py           cart-validated codes (coupon_checks.yaml)
   coupons.py                 aggregator codes + cashback portals (informational)

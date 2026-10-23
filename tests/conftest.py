@@ -5,9 +5,9 @@ suite may run, so no test reads the real file implicitly: by default every
 test sees a missing checks file. Tests that need checks write their own (see
 ``write_checks``).
 
-The Amazon scraper keeps process-wide state (request pacer, shared session,
-per-source poll counters, dp cache): every test starts from a fresh copy with
-the pacer's waits turned off (tests that check pacing build their own Pacer).
+The Amazon scraper keeps process-wide state (request pacer, shared session):
+every test starts from a fresh copy with the pacer's waits turned off (tests
+that check pacing build their own Pacer).
 """
 from pathlib import Path
 

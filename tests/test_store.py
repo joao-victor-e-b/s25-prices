@@ -214,3 +214,134 @@ def test_merge_never_lets_an_older_row_overwrite(tmp_path):
     c = _row(upstream, "SELECT * FROM coupon_codes WHERE code='SHARED'")
     assert (c["active"], c["last_seen"]) == (0, "2026-10-23T06:10:00+00:00")
     assert c["sources"] == "pelando,promobit" and c["first_seen"] == "2026-10-23T05:00:00+00:00"
+
+
+# --- offer_summary: the dp's offers line per ASIN ---------------------------------
+
+from src.models import OfferSummary   # noqa: E402
+
+A256 = "B0FTMQQ7L2"
+
+
+def _sum(ts=T0, asin=A256, **kw):
+    base = dict(asin=asin, offers_total=3, min_card_price=4582.47, min_shipping=13.22,
+                scope="ALL", ts=ts)
+    base.update(kw)
+    return OfferSummary(**base)
+
+
+def _summaries(conn) -> list:
+    return conn.execute("SELECT * FROM offer_summary ORDER BY ts").fetchall()
+
+
+def test_offer_summary_is_stored_on_change_and_hourly(conn):
+    assert store.insert_offer_summary(conn, _sum()) is True
+    assert store.insert_offer_summary(conn, _sum(_at(4))) is False         # unchanged
+    assert store.insert_offer_summary(conn, _sum(_at(8), storage_gb=512)) is False  # transient
+    for i, kw in enumerate([dict(offers_total=4), dict(min_card_price=3900.0),
+                            dict(min_shipping=None), dict(scope="NEW")]):
+        assert store.insert_offer_summary(conn, _sum(_at(12 + i), **kw)) is True, kw
+    assert store.insert_offer_summary(conn, _sum(_at(20), scope="NEW")) is False
+    assert store.insert_offer_summary(conn, _sum(_at(75), scope="NEW")) is True   # hourly
+    assert store.insert_offer_summary(conn, _sum(_at(76), asin="OTHER")) is True
+    rows = _summaries(conn)
+    assert len(rows) == 7
+    assert dict(rows[0]) == {"ts": T0, "asin": A256, "offers_total": 3,
+                             "min_card_price": 4582.47, "min_shipping": 13.22,
+                             "scope": "ALL"}
+
+
+def test_offer_summary_queries(conn):
+    store.insert_offer_summary(conn, _sum())
+    store.insert_offer_summary(conn, _sum(_at(4), min_card_price=3800.0))
+    store.insert_offer_summary(conn, _sum(_at(8), asin="B0FTMWWS8Y", offers_total=4))
+    assert store.last_offer_summary(conn, A256)["min_card_price"] == 3800.0
+    assert store.last_offer_summary(conn, A256, _at(4))["ts"] == T0       # strictly before
+    assert store.last_offer_summary(conn, "NONE") is None
+    latest = store.latest_offer_summaries(conn)
+    assert {a: r["ts"] for a, r in latest.items()} == {A256: _at(4), "B0FTMWWS8Y": _at(8)}
+    assert set(store.latest_offer_summaries(conn, since=_at(5))) == {"B0FTMWWS8Y"}
+
+
+def test_last_offer_departure(conn):
+    # the 🔍 ladder's "sold out": a no-line page, or a count drop with nothing
+    # within the ceiling left — never a reprice across it at the same count
+    for i, kw in enumerate([dict(offers_total=4, min_card_price=3915.0, min_shipping=0.0),
+                            dict(offers_total=4, min_card_price=3925.0, min_shipping=0.0),
+                            dict(offers_total=4, min_card_price=3915.0, min_shipping=0.0),
+                            dict(offers_total=4, min_card_price=3910.0, min_shipping=13.22)]):
+        store.insert_offer_summary(conn, _sum(_at(4 * i), **kw))
+    assert store.last_offer_departure(conn, A256, 3919, _at(60)) is None   # reprices only
+    store.insert_offer_summary(conn, _sum(_at(16), offers_total=3, min_card_price=4582.47))
+    assert store.last_offer_departure(conn, A256, 3919, _at(60)) == _at(16)  # 4 -> 3, > 3919
+    assert store.last_offer_departure(conn, A256, 3919, _at(16)) is None   # before now only
+    store.insert_offer_summary(conn, _sum(_at(20), offers_total=2, min_card_price=3800.0))
+    assert store.last_offer_departure(conn, A256, 3919, _at(60)) == _at(16)  # 3800 still cheap
+    store.insert_offer_summary(conn, _sum(_at(24), offers_total=1, min_card_price=4582.47,
+                                          min_shipping=None, scope="NONE"))
+    assert store.last_offer_departure(conn, A256, 3919, _at(60)) == _at(24)  # no line
+    assert store.last_offer_departure(conn, "B0FTMWWS8Y", 3919, _at(60)) is None
+
+
+def test_recent_offers_are_the_latest_live_rows_of_the_asin(conn):
+    def obs(lid, ts, **kw):
+        base = dict(source_id="amazon_seminovos", seller="S", venue="amazon",
+                    listing_id=lid, url="u", ts=ts, list_price=3890.0, in_stock=True)
+        base.update(kw)
+        store.insert_observation(conn, Observation(**base), dedup=False)
+    obs(f"{A256}:A:aceitavel", _at(0))
+    obs(f"{A256}:A:aceitavel", _at(4), list_price=3880.0)          # latest wins
+    obs(f"{A256}:B:excelente", _at(0))
+    obs(f"{A256}:B:excelente", _at(8), in_stock=False)            # sold out since
+    obs(f"{A256}:C:bom", _at(-200))                                # stale
+    obs(f"{A256}:D:bom", _at(0), list_price=None)                  # unpriced
+    obs("B0FTMWWS8Y:A:excelente", _at(0))                          # other ASIN
+    obs(f"{A256}:E:excelente", _at(30))                            # after now
+    rows = store.recent_offers(conn, A256, _at(-120), _at(20))
+    assert [(r["listing_id"], r["list_price"]) for r in rows] == [(f"{A256}:A:aceitavel", 3880.0)]
+
+
+def test_init_db_adds_offer_summary_to_an_old_db(tmp_path):
+    db = tmp_path / "old.db"
+    c = sqlite3.connect(db)
+    c.executescript(_OLD_OBSERVATIONS)       # a DB from before the table existed
+    c.commit()
+    c.close()
+    conn = store.connect(db)
+    store.init_db(conn)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(offer_summary)")]
+    assert cols == ["ts", "asin", "offers_total", "min_card_price", "min_shipping", "scope"]
+    assert store.insert_offer_summary(conn, _sum()) is True
+    assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1   # kept
+
+
+def test_merge_unions_offer_summary_rows(tmp_path):
+    def _with(path, *summaries):
+        conn = store.connect(path)
+        store.init_db(conn)
+        for s in summaries:
+            store.insert_offer_summary(conn, s)
+        conn.commit()
+        conn.close()
+        return path
+
+    upstream = _with(tmp_path / "up.db", _sum(), _sum(_at(4), offers_total=4))
+    ours = _with(tmp_path / "ours.db", _sum(), _sum(_at(6), offers_total=5))
+    added = store.merge_db_rows(ours, upstream)
+    assert added["offer_summary"] == 1                    # T0 is on both sides
+    conn = store.connect(upstream)
+    assert [r["offers_total"] for r in _summaries(conn)] == [3, 4, 5]
+    conn.close()
+
+    # a watcher still on the old schema (no table) merges into a new DB, and
+    # an old upstream gets the table from init_db before ours are copied in
+    old = tmp_path / "old.db"
+    c = sqlite3.connect(old)
+    c.executescript(_OLD_OBSERVATIONS)
+    c.commit()
+    c.close()
+    assert "offer_summary" not in store.merge_db_rows(old, upstream)
+    store.merge_db_rows(ours, old)
+    conn = store.connect(old)
+    assert [r["offers_total"] for r in _summaries(conn)] == [3, 5]
+    conn.close()

@@ -12,6 +12,8 @@ in-memory observations — so nothing is lost by skipping.
 
 The committed DB predates some columns; ``init_db`` adds missing ones in place
 (``_ADDED_COLUMNS``) because CREATE TABLE IF NOT EXISTS never alters a table.
+A table added later (``offer_summary``, Oct 2026) just appears on the next
+``init_db`` of an old DB, and follows the same change-only storage.
 """
 from __future__ import annotations
 
@@ -110,6 +112,22 @@ CREATE TABLE IF NOT EXISTS offer_promos (
   PRIMARY KEY (asin, seller_id, message)
 );
 
+-- The product page's "Comparar outras N ofertas a partir de R$ X" line per
+-- ASIN (models.OfferSummary): every offer counted, buybox included, and the
+-- lowest card price, sellers unnamed — all CI can see while Amazon 503s the
+-- offers panel. Stored on change + hourly, like observations. scope NONE is
+-- a page that loaded without the line: its buybox was the only offer
+-- (offers_total 1, its card price; 0 and NULL when unavailable).
+CREATE TABLE IF NOT EXISTS offer_summary (
+  ts              TIMESTAMP NOT NULL,
+  asin            TEXT NOT NULL,
+  offers_total    INTEGER,
+  min_card_price  NUMERIC,       -- NULL: the line showed no price
+  min_shipping    NUMERIC,       -- "+R$ X de envio"; 0 = GRÁTIS; NULL = not shown
+  scope           TEXT,          -- ALL | NEW | USED (the link's condition=) | NONE (no line)
+  PRIMARY KEY (asin, ts)
+);
+
 -- One row per poll so the heartbeat can report real failure counts
 -- (stderr in the Actions log is invisible day to day).
 CREATE TABLE IF NOT EXISTS run_log (
@@ -170,6 +188,21 @@ def _same(a, b) -> bool:
     return a == b
 
 
+def _fresh_twin(prev: sqlite3.Row | None, item, ts: str | None, fields) -> bool:
+    """Is ``prev`` (the latest stored row for ``item``'s key) identical on
+    ``fields`` and younger than UNCHANGED_REFRESH_MINUTES at ``ts``?"""
+    if not ts or prev is None or prev["ts"] >= ts:
+        return False
+    try:
+        age = datetime.fromisoformat(ts) - datetime.fromisoformat(prev["ts"])
+    except ValueError:
+        return False
+    if age >= timedelta(minutes=UNCHANGED_REFRESH_MINUTES):
+        return False
+    keys = set(prev.keys())
+    return all(_same(getattr(item, f), prev[f] if f in keys else None) for f in fields)
+
+
 def _unchanged_recently(conn: sqlite3.Connection, obs: Observation) -> bool:
     """Is the listing's latest stored row identical (``_CHANGE_FIELDS``) and
     younger than UNCHANGED_REFRESH_MINUTES?"""
@@ -180,17 +213,7 @@ def _unchanged_recently(conn: sqlite3.Connection, obs: Observation) -> bool:
         "ORDER BY ts DESC LIMIT 1",
         (obs.source_id, obs.listing_id),
     ).fetchone()
-    if prev is None or prev["ts"] >= obs.ts:
-        return False
-    try:
-        age = datetime.fromisoformat(obs.ts) - datetime.fromisoformat(prev["ts"])
-    except ValueError:
-        return False
-    if age >= timedelta(minutes=UNCHANGED_REFRESH_MINUTES):
-        return False
-    keys = set(prev.keys())
-    return all(_same(getattr(obs, f), prev[f] if f in keys else None)
-               for f in _CHANGE_FIELDS)
+    return _fresh_twin(prev, obs, obs.ts, _CHANGE_FIELDS)
 
 
 def insert_observation(conn: sqlite3.Connection, obs: Observation,
@@ -207,6 +230,102 @@ def insert_observation(conn: sqlite3.Connection, obs: Observation,
         row,
     )
     return True
+
+
+_SUMMARY_FIELDS = ("offers_total", "min_card_price", "min_shipping", "scope")
+
+
+def last_offer_summary(conn: sqlite3.Connection, asin: str,
+                       before_ts: str | None = None) -> sqlite3.Row | None:
+    """The ASIN's latest stored offers line (before ``before_ts``, if given)."""
+    return conn.execute(
+        "SELECT * FROM offer_summary WHERE asin=? AND (? IS NULL OR ts < ?) "
+        "ORDER BY ts DESC LIMIT 1",
+        (asin, before_ts, before_ts),
+    ).fetchone()
+
+
+def insert_offer_summary(conn: sqlite3.Connection, s, dedup: bool = True) -> bool:
+    """Store one ``models.OfferSummary`` (``s.ts`` set); like observations,
+    an unchanged line is skipped while the ASIN's latest row is under an hour
+    old. Returns False when skipped."""
+    if dedup and _fresh_twin(last_offer_summary(conn, s.asin), s, s.ts, _SUMMARY_FIELDS):
+        return False
+    row = s.as_row()
+    conn.execute(
+        f"INSERT OR REPLACE INTO offer_summary ({', '.join(row)}) "
+        f"VALUES ({', '.join(':' + k for k in row)})",
+        row,
+    )
+    return True
+
+
+def latest_offer_summaries(conn: sqlite3.Connection,
+                           since: str | None = None) -> dict[str, sqlite3.Row]:
+    """The latest offers line per ASIN (only ASINs seen at/after ``since``)."""
+    rows = conn.execute(
+        """
+        SELECT s.* FROM offer_summary s
+        JOIN (SELECT asin, MAX(ts) AS mts FROM offer_summary GROUP BY asin) latest
+        ON s.asin=latest.asin AND s.ts=latest.mts
+        WHERE (? IS NULL OR s.ts >= ?)
+        """,
+        (since, since),
+    ).fetchall()
+    return {r["asin"]: r for r in rows}
+
+
+def last_offer_departure(conn: sqlite3.Connection, asin: str, ceiling: float,
+                         now: str) -> str | None:
+    """ts of the ASIN's latest stored reading before ``now`` that shows an
+    offer *left* — the 🔍 ladder's "sold out", after which a cheap offer
+    showing up again is news:
+
+    - a no-line marker (scope NONE): the page loaded without the line, so
+      only the buybox was left;
+    - a line whose count fell below the reading stored just before it while
+      its cheapest offer (card + shipping) is above ``ceiling``: a seller
+      left and nothing within the ceiling remains.
+
+    A cheapest offer moving back and forth across the ceiling at the same
+    count is a reprice, not a departure (it reset the ladder every time when
+    any line above the ceiling counted, re-alerting at the same price)."""
+    row = conn.execute(
+        """
+        SELECT MAX(ts) FROM (
+          SELECT ts, scope, offers_total, min_card_price, min_shipping,
+                 LAG(offers_total) OVER (ORDER BY ts) AS prev_total
+          FROM offer_summary WHERE asin=? AND ts < ?)
+        WHERE scope = 'NONE'
+           OR (min_card_price IS NOT NULL
+               AND min_card_price + COALESCE(min_shipping, 0) > ?
+               AND offers_total < prev_total)
+        """,
+        (asin, now, ceiling),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def recent_offers(conn: sqlite3.Connection, asin: str, since: str,
+                  now: str) -> list[sqlite3.Row]:
+    """Latest stored snapshot (up to ``now``) of each Amazon listing of
+    ``asin`` (``{asin}:...``), kept only when it is in stock, priced and
+    from ``since`` on: the offers the 🔍 trigger still counts as known while
+    a poll can't read the offers panel. A listing whose latest row is a
+    sell-out, or that hasn't been seen since ``since``, is left out — it must
+    not pass for the offer behind the line."""
+    return conn.execute(
+        """
+        SELECT o.* FROM observations o
+        JOIN (SELECT source_id, listing_id, MAX(ts) AS mts FROM observations
+              WHERE listing_id LIKE ? AND ts <= ? GROUP BY source_id, listing_id) latest
+        ON o.source_id=latest.source_id AND o.listing_id=latest.listing_id
+        AND o.ts=latest.mts
+        WHERE o.venue='amazon' AND o.in_stock=1 AND o.list_price IS NOT NULL
+          AND o.ts >= ?
+        """,
+        (f"{asin}:%", now, since),
+    ).fetchall()
 
 
 def insert_promo(conn: sqlite3.Connection, promo, ts: str) -> None:
@@ -388,10 +507,11 @@ def merge_db_rows(src_path: Path, dst_path: Path) -> dict[str, int]:
     """Copy the rows of the DB at ``src_path`` into ``dst_path``. Used by
     gitsync when two watchers' snapshots of the binary DB conflict, so the
     result loses nothing either side saw: append-only tables (observations,
-    alerts_sent, run_log, ...) take the rows ``dst`` lacks (INSERT OR IGNORE on
-    the primary key); upserted tables (``_UPSERTED``) keep the newer state of a
-    row both have. Columns are those both DBs share. Returns rows added or
-    updated per table."""
+    alerts_sent, run_log, offer_summary, ...) take the rows ``dst`` lacks
+    (INSERT OR IGNORE on the primary key); upserted tables (``_UPSERTED``) keep
+    the newer state of a row both have. Columns are those both DBs share; a
+    table only one side has yet is created by ``init_db`` (dst) or simply has
+    nothing to copy (src). Returns rows added or updated per table."""
     conn = connect(Path(dst_path))
     try:
         init_db(conn)

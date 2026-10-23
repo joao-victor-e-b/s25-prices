@@ -11,8 +11,6 @@
 #   module  scraper module name (null until implemented)
 #   enabled false = skipped by poll and heartbeat (config kept for later)
 #   every   N = poll on every Nth loop iteration only (default 1)
-#   dp_every N = Amazon product page on every Nth poll of the source (default 4;
-#           the offers panel, fetched every poll, carries the card prices)
 #   default_grade  condition for a buybox that names none (new units: Novo)
 #
 # Amazon-only mode (Oct 2026): the user buys on amazon.com.br in 12x, so every

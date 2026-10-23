@@ -30,13 +30,16 @@ def _offer(**kw):
 
 
 class FakeSource:
-    def __init__(self, offers=(), degraded=None, error=None):
+    def __init__(self, offers=(), degraded=None, error=None, summary=None):
         self.offers, self.degraded, self.error = list(offers), degraded or [], error
         self.complete = False
+        self.summary = summary          # the dp's offers line to report
+        self.offer_summary = None
 
     def fetch(self):
         if self.error:
             raise self.error
+        self.offer_summary = copy.deepcopy(self.summary)
         return [copy.deepcopy(o) for o in self.offers]
 
 
@@ -56,6 +59,8 @@ class Env:
         monkeypatch.setattr(run, "load_source", lambda cfg: self.source)
         monkeypatch.setattr(notify, "notify", self._notify)
         monkeypatch.setattr(notify, "notify_offer_promos", self._notify_promos)
+        monkeypatch.setattr(notify, "notify_unseen", self._notify_unseen)
+        self.unseen = []
 
     def _report(self, n):
         return {"sent": n, "wa_ok": False, "ntfy_ok": self.delivered,
@@ -68,6 +73,10 @@ class Env:
     def _notify_promos(self, blocks):
         self.promo_blocks.extend(blocks)
         return self._report(len(blocks))
+
+    def _notify_unseen(self, alerts):
+        self.unseen.extend(alerts)
+        return self._report(len(alerts))
 
     def poll(self, *offers, **kw):
         if offers:
@@ -420,17 +429,19 @@ def test_poll_logs_requests_and_aod_ratio(env, capsys):
             amazon_mod.PACER.wait()
             amazon_mod.PACER.wait()
             self.aod_tried, self.aod_ok = 1, 0
-            self.block_level = "soft"
+            self.ingress_tried, self.ingress_ok = 1, 1
+            self.block_level, self.blocked = None, False   # panel 503, dp fine
             self.degraded = ["aod: amazon aod: HTTP 503"]
             return super().fetch()
 
     env.source = Counting([_offer()])
     r = env.poll()
     assert (r["requests"], r["aod_ok"], r["aod_tried"]) == (2, 0, 1)
-    assert r["amazon_block"] == "soft" and r["amazon_trouble"] is True
-    assert "[amazon] requests=2 aod_ok=0/1 backoff=soft" in capsys.readouterr().err
+    assert (r["ingress_ok"], r["ingress_tried"]) == (1, 1)
+    assert r["amazon_block"] is None and r["amazon_trouble"] is False   # no backoff
+    assert "[amazon] requests=2 aod_ok=0/1 ingress=1/1\n" in capsys.readouterr().err
     (row,) = env.rows("SELECT detail FROM run_log")
-    assert row["detail"].startswith("aod_ok=0/1 req=2 | amazon_seminovos partial:")
+    assert row["detail"].startswith("aod_ok=0/1 req=2 ingress=1/1 | amazon_seminovos partial:")
 
 
 def test_a_raising_amazon_source_is_hard_trouble(env):
@@ -445,3 +456,208 @@ def test_new_unit_listings_poll_every_third_iteration():
     every = {c["id"]: c.get("every", 1) for c in run.load_registry()}
     assert every["amazon_seminovos"] == every["amazon_seminovos_512"] == 1
     assert {every[k] for k in every if k.startswith("amazon_novo")} == {3}
+
+
+# --- the dp's offers line: offer_summary, 🔍 alerts, heartbeat (Oct 2026) ------------
+
+from pathlib import Path   # noqa: E402
+
+from src.models import OfferSummary   # noqa: E402
+
+FIX = Path(__file__).parent / "fixtures"
+
+
+def _line(n=3, price=4582.47, shipping=13.22, asin=ASIN, scope="ALL"):
+    return OfferSummary(asin=asin, offers_total=n, min_card_price=price,
+                        min_shipping=shipping, scope=scope, storage_gb=256, color="preto")
+
+
+def test_offer_summary_stored_on_change_and_a_rise_is_only_noted(env, capsys):
+    env.source = FakeSource([_offer()], summary=_line())
+    env.poll()
+    env.poll()                                     # unchanged 4 min later: skipped
+    env.source.summary = _line(n=4)
+    r = env.poll()
+    rows = env.rows("SELECT ts, offers_total, min_card_price, min_shipping, scope "
+                    "FROM offer_summary ORDER BY ts")
+    assert [(x["offers_total"], x["min_card_price"], x["min_shipping"], x["scope"])
+            for x in rows] == [(3, 4582.47, 13.22, "ALL"), (4, 4582.47, 13.22, "ALL")]
+    assert r["alerts"] == r["unseen_alerts"] == 0 and env.unseen == []   # record only
+    detail = env.rows("SELECT detail FROM run_log ORDER BY ts DESC")[0]["detail"]
+    assert detail.startswith("aod_ok=0/0 req=0 ingress=0/0 | ")
+    assert f"{ASIN} offers 3->4 from 4582.47" in detail
+    assert f"[offers] {ASIN} offers 3->4" in capsys.readouterr().out
+    env.source.summary = _line(n=2)
+    env.poll()                                     # a drop is not noted
+    detail = env.rows("SELECT detail FROM run_log ORDER BY ts DESC")[0]["detail"]
+    assert "offers" not in detail
+
+
+def test_unseen_offer_alert_is_sent_and_recorded_once(env):
+    # buybox 3.950 (above every threshold), the line says "a partir de 3.700 + 13,22"
+    env.source = FakeSource([_offer()], summary=_line(n=4, price=3700.0))
+    r = env.poll()
+    (a,) = env.unseen
+    assert r["unseen_alerts"] == 1 and env.alerts == []
+    assert (a.level, a.metric, a.attributed, a.attributed_min) == (
+        "aggressive", 3713.22, 1, 3950.0)
+    (sent,) = env.rows("SELECT listing_id, trigger, pv FROM alerts_sent")
+    assert tuple(sent) == (f"unseen:{ASIN}", "unseen_offer", 3713.22)
+    env.poll()
+    assert len(env.unseen) == 1                    # deduped by the ladder
+
+
+def test_unseen_offer_retried_until_delivered(env):
+    env.source = FakeSource([_offer()], summary=_line(n=4, price=3700.0))
+    env.delivered = False
+    env.poll()
+    assert env.rows("SELECT * FROM alerts_sent") == []
+    env.delivered = True
+    env.poll()
+    env.poll()
+    assert len(env.unseen) == 2 and len(env.rows("SELECT * FROM alerts_sent")) == 1
+
+
+def test_unseen_offer_dry_run_prints_and_records_nothing(env, capsys):
+    env.source = FakeSource([_offer()], summary=_line(n=4, price=3700.0))
+    env.poll(dry_run=True)
+    out = capsys.readouterr().out
+    assert "[dry-run] 1 unseen-offer alert(s) would send:" in out
+    assert "🔍 Amazon 256GB preto: oferta a partir de R$ 3.713,22" in out
+    assert env.unseen == [] and env.rows("SELECT * FROM alerts_sent") == []
+    assert len(env.rows("SELECT * FROM offer_summary")) == 1   # history still kept
+    env.poll()
+    assert len(env.unseen) == 1                    # the dry run didn't consume it
+
+
+def test_heartbeat_offers_line_from_the_latest_rows(tmp_path):
+    conn = _hb_conn(tmp_path)
+    assert "Ofertas" not in run._heartbeat_message(conn, NOW)    # no rows: no line
+    for s, ts in ((_line(), "2026-10-23T09:00:00+00:00"),
+                  (_line(n=2, price=4300.0), "2026-10-23T11:00:00+00:00"),   # latest 256
+                  (_line(n=4, price=4149.0, shipping=None, asin="B0FTMWWS8Y"),
+                   "2026-10-23T11:30:00+00:00"),
+                  (_line(n=5, price=5799.0, asin="B0DSYJCY45", scope="NEW"),  # new unit
+                   "2026-10-23T11:30:00+00:00"),
+                  (_line(n=2, asin="B0DSXZ4FZT"), "2026-10-20T11:30:00+00:00")):  # stale
+        s.ts = ts
+        store.insert_offer_summary(conn, s)
+    lines = run._heartbeat_message(conn, NOW).split("\n")
+    assert lines[2] == "Ofertas: 256GB 2 (menor R$ 4.300,00) · 512GB 4 (menor R$ 4.149,00)"
+    assert lines[3].startswith("🎟️ testar")
+
+
+def test_poll_with_the_offers_panel_blocked_is_not_trouble(env, monkeypatch, capsys):
+    # the real source end to end: the dp loads, the panel 503s (CI, Oct 2026)
+    from src.sources import amazon as amazon_mod
+    from tests.test_amazon import AOD_ERROR_BODY, _Resp
+
+    env.source = amazon_mod.AmazonSeminovosSource({
+        "id": "amazon_seminovos", "venue": "amazon", "asin": ASIN,
+        "url": f"https://www.amazon.com.br/dp/{ASIN}",
+        "match": {"storage_gb": 256, "colors": ["preto", "jetblack"]}})
+    calls = []
+
+    def get(url, headers=None, timeout=None):
+        calls.append(url)
+        if "aodAjaxMain" in url:
+            return _Resp(503, AOD_ERROR_BODY)
+        return _Resp(200, (FIX / "amazon_dp_pix.html").read_bytes())
+    monkeypatch.setattr(env.source.session, "get", get)
+    r = env.poll()
+    assert len(calls) == 2                         # dp + one panel try, no retry
+    assert r["amazon_block"] is None and r["amazon_trouble"] is False
+    assert (r["aod_ok"], r["aod_tried"], r["ingress_ok"], r["ingress_tried"]) == (0, 1, 1, 1)
+    assert r["observations"] == 1 and r["unseen_alerts"] == 0   # the line's min = buybox
+    (row,) = env.rows("SELECT detail FROM run_log")
+    assert row["detail"].startswith("aod_ok=0/1 req=2 ingress=1/1 | amazon_seminovos partial:")
+    (s,) = env.rows("SELECT asin, offers_total, min_card_price, min_shipping, scope "
+                    "FROM offer_summary")
+    assert tuple(s) == (ASIN, 3, 4582.47, 13.22, "ALL")
+    assert "backoff" not in capsys.readouterr().err
+
+
+# --- review round: known offers, the no-line marker, the heartbeat -----------------
+
+def _no_line(price=4582.47, asin=ASIN, n=1):
+    return OfferSummary(asin=asin, offers_total=n, min_card_price=price,
+                        scope=OfferSummary.NO_LINE, storage_gb=256, color="preto")
+
+
+def test_unseen_quiet_for_an_offer_the_last_poll_named(env):
+    # Q1: the panel loads — Excelente buybox 4.275,78 + an Aceitável unit at
+    # 3.890, which is the line's minimum. Q2: the panel 503s, only the buybox
+    # is named, the line is unchanged: that Aceitável unit is no hidden offer.
+    buybox = _offer(list_price=4275.78, pix_discount=0.0, installments_n=None,
+                    installment_value=None, promos=[])
+    aceitavel = _offer(listing_id=f"{ASIN}:A3SPPFNXUZXE4P:aceitavel",
+                       seller="Assurant Ecophone", grade_raw="Aceitável",
+                       list_price=3890.0, pix_discount=0.0, installments_n=None,
+                       installment_value=None, promos=[])
+    env.source = FakeSource([buybox, aceitavel], summary=_line(n=4, price=3890.0,
+                                                               shipping=0.0))
+    r1 = env.poll()
+    env.source.offers = [buybox]
+    r2 = env.poll()
+    assert r1["unseen_alerts"] == r2["unseen_alerts"] == 0 and env.unseen == []
+    assert env.alerts == []                       # Aceitável never alerts
+
+
+def test_unseen_quiet_when_the_buybox_rotates_away_from_an_alerted_offer(env):
+    # R1: Assurant Excelente 3.900 holds the buybox -> 🟡. R2: CellularStore
+    # 4.582,47 holds it; the line still says 3.900 — the offer we just alerted
+    assurant = _offer(listing_id=f"{ASIN}:A3SPPFNXUZXE4P:excelente",
+                      seller="Assurant Ecophone", list_price=3900.0, pix_discount=0.0,
+                      installments_n=None, installment_value=None, promos=[])
+    env.source = FakeSource([assurant], summary=_line(n=3, price=3900.0, shipping=0.0))
+    env.poll()
+    assert [a.trigger for a in env.alerts] == ["year_low"]
+    env.source.offers = [_offer(list_price=4582.47, pix_discount=0.0, promos=[])]
+    r = env.poll()
+    assert r["unseen_alerts"] == 0 and env.unseen == []
+    assert len(env.alerts) == 1
+
+
+def test_line_that_disappears_is_stored_as_a_marker_and_resets_the_ladder(env, capsys):
+    env.source = FakeSource([_offer()], summary=_line(n=2, price=3700.0))
+    env.poll()
+    assert len(env.unseen) == 1                    # 🔍 at 3.713,22
+    env.source.summary = _no_line(3950.0)          # sold: only the buybox is left
+    r = env.poll()
+    assert r["unseen_alerts"] == 0 and len(env.unseen) == 1
+    rows = env.rows("SELECT offers_total, min_card_price, scope FROM offer_summary "
+                    "ORDER BY ts")
+    assert [tuple(x) for x in rows] == [(2, 3700.0, "ALL"), (1, 3950.0, "NONE")]
+    # the heartbeat reports the lone buybox, not the vanished line
+    conn = store.connect(env.db)
+    try:
+        assert run._offer_lines(conn, store.now_iso(), [
+            {"asin": ASIN, "match": {"storage_gb": 256}}]) == [("256GB", 1, 3950.0)]
+    finally:
+        conn.close()
+    # a blocked page writes nothing (no marker, no line)
+    env.source.error = RuntimeError("amazon: captcha / bot wall")
+    env.poll()
+    assert len(env.rows("SELECT * FROM offer_summary")) == 2
+    env.source.error = None
+    # the same price coming back is a new offer: it alerts again, and 1 -> 2 is noted
+    env.source.summary = _line(n=2, price=3700.0)
+    r = env.poll()
+    assert r["unseen_alerts"] == 1 and len(env.unseen) == 2
+    detail = env.rows("SELECT detail FROM run_log ORDER BY ts DESC")[0]["detail"]
+    assert f"{ASIN} offers 1->2 from 3700.00" in detail
+
+
+def test_heartbeat_skips_new_unit_listings_and_shows_the_marker(tmp_path):
+    conn = _hb_conn(tmp_path)
+    for s, ts in ((_line(n=3, price=3800.0), "2026-10-23T09:00:00+00:00"),
+                  (_no_line(4582.47), "2026-10-23T11:00:00+00:00"),         # line gone
+                  (_line(n=4, price=4149.0, shipping=None, asin="B0FTMWWS8Y"),
+                   "2026-10-23T11:30:00+00:00"),
+                  # new-unit pages: a stray ALL-scoped line and a marker
+                  (_line(n=6, price=5999.0, asin="B0DSYJCY45"), "2026-10-23T11:30:00+00:00"),
+                  (_no_line(7110.0, asin="B0DSXZ4FZT"), "2026-10-23T11:30:00+00:00")):
+        s.ts = ts
+        store.insert_offer_summary(conn, s)
+    lines = run._heartbeat_message(conn, NOW).split("\n")
+    assert lines[2] == "Ofertas: 256GB 1 (menor R$ 4.582,47) · 512GB 4 (menor R$ 4.149,00)"

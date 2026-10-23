@@ -11,30 +11,39 @@ succeeds. Blocks are detected (captcha markers, missing #productTitle, error
 pages) and *raise*, so the run counts a fetch failure in the heartbeat rather
 than silently reporting "no deal" (spec §7 decay warning).
 
-Two pages per ASIN, on one shared session:
+Two pages per ASIN, every poll, on one shared session:
 
-1. ``aodAjaxMain`` — the "Comparar outras ofertas" (All Offers Display) panel:
-   every seller's offer for the ASIN, with each card price on its add-to-cart
-   label — all the 12x total needs. Without it a cheaper non-buybox seller is
-   invisible (Assurant Ecophone at R$3.919 was missed whenever CellularStore
-   held the buybox). Fetched every poll, first.
-2. ``/dp/{asin}`` — the product page. Only shows the *buybox* offer, but it is
-   the only place with the installment plan ("12x de R$ 381,90 sem juros"),
-   the clip-coupon widget and the buybox promos. Fetched only when due: the
-   session has no Amazon cookies yet (a cold session's XHR gets 503s), every
-   ``dp_every``-th poll of the source (DP_EVERY), every poll while the last dp
-   showed a coupon (it moves the 12x total), and as the fallback when the AOD
-   failed. In between, the last dp's plan/promos are merged onto the AOD's
-   pinned offer (the buybox) while its card price is unchanged.
+1. ``/dp/{asin}`` — the product page, first. It shows only the *buybox* offer,
+   but it is the only place with the installment plan ("12x de R$ 381,90 sem
+   juros"), the clip-coupon widget and the buybox promos, and it carries the
+   "Comparar outras N ofertas a partir de R$ X (+R$ Y de envio)" line
+   (``#aod-ingress-link``, read by ``parse_ingress`` into ``offer_summary``):
+   how many offers the ASIN has, buybox included, and the lowest card price
+   among them — sellers unnamed. A page without that line has no other
+   offers; it gets a no-line marker instead (``_mark_no_line``).
+2. ``aodAjaxMain`` — the "Comparar outras ofertas" (All Offers Display) panel:
+   every seller's offer, each card price on its add-to-cart label. Without it
+   a cheaper non-buybox seller can't be named (Assurant Ecophone at R$3.919
+   was missed whenever CellularStore held the buybox). Tried once per poll;
+   the dp buybox's plan/promos are merged onto its pinned offer.
 
-Amazon rate-limits bursts from datacenter IPs (CI got HTTP 503 on most AODs
-at 6 ASINs x 2 requests a minute), so every Amazon request in the process goes
-through one ``PACER`` (AMAZON_MIN_GAP_S ± 30% apart, all sources and the
-promotion-terms lookup together), and a blocked AOD is retried once after
-AOD_RETRY_WAIT_S before falling back to the dp buybox (yesterday's coverage,
-not zero); only when both fail does fetch() raise. ``block_level`` tells the
-loop how hard to back off: "soft" (AOD blocked, dp fine) or "hard" (the dp
-itself blocked / captcha).
+Why the dp leads: from GitHub Actions IPs the panel mostly answers HTTP 503
+(Oct 2026, two CI diagnostic runs blocked every variant: aodAjaxMain,
+/gp/aod/ajax, full Chrome client hints, cold/warm/mobile sessions,
+/gp/offer-listing, repeated retries; the live watcher gets it on and off),
+while /dp/ always loads — and ``/dp/?smid=<seller>`` does not move its
+buybox, so per-seller pages are no way round. In CI the dp is therefore often
+the whole picture: the buybox plus the offers line, whose "a partir de" price
+below every offer we know raises the 🔍 alert (``triggers.unseen_offers``). A
+blocked panel is not retried (the 45 s retry never once helped) and is not
+pushback.
+
+Amazon rate-limits bursts from datacenter IPs, so every Amazon request in the
+process goes through one ``PACER`` (AMAZON_MIN_GAP_S ± 30% apart, all sources
+and the promotion-terms lookup together). fetch() raises only when neither
+page gave us anything. ``block_level`` tells the loop whether to back off:
+"hard" when the dp itself was blocked (captcha, HTTP error, no title), None
+otherwise — the panel failing next to a good dp is CI's steady state.
 
 Price semantics (same as the other sources, so normalize.pv() works):
 ``list_price`` is the *card* price — what the sem-juros plan totals — and
@@ -62,9 +71,9 @@ nodes dropped) and lands in the transient ``Observation.promos`` with its id in
 ``promo_ids``, so the orchestrator can announce one it has never seen;
 ``is_routine_promo`` tells the everyday Pix/NuPay "(5% off)" line apart.
 
-``blocked`` (set by fetch) is real pushback — captcha, an HTTP error, a dp
-that raised — as opposed to an empty listing (an AOD with no offers while the
-dp parsed fine), so the loop only backs off when Amazon actually resists.
+``blocked`` (set by fetch) is real pushback — a dp that raised (captcha, HTTP
+error, no title) — as opposed to a panel that failed or came back empty while
+the dp parsed fine, so the loop only backs off when Amazon actually resists.
 
 ``listing_id`` is ``{asin}:{seller_id}:{grade}`` (e.g.
 ``B0FTMQQ7L2:A2TO0KKQTM1BAB:excelente``): every seller shares the ASIN, and one
@@ -85,7 +94,7 @@ from dataclasses import dataclass, field
 
 from bs4 import BeautifulSoup
 
-from ..models import Observation
+from ..models import Observation, OfferSummary
 from ..normalize import coupon_from_text
 from .base import Source, http_session
 
@@ -150,15 +159,12 @@ _DEFAULT_MATCH = {"storage_gb": 256, "colors": ["preto", "jetblack"]}
 
 AMAZON_MIN_GAP_S = 10.0   # between any two Amazon requests in the process
 GAP_JITTER = 0.3          # ± share of the gap
-AOD_RETRY_WAIT_S = 45.0   # before retrying a blocked AOD once
-DP_EVERY = 4              # product page on every Nth poll of a source (registry: dp_every)
 
 
 class Pacer:
     """Process-wide spacing between Amazon requests: each waits until
-    ``gap`` (± jitter) has passed since the previous one, or a longer
-    ``defer``-red wait (the AOD retry). ``count`` is requests made, for the
-    per-poll log. Tests zero ``gap``."""
+    ``gap`` (± jitter) has passed since the previous one. ``count`` is
+    requests made, for the per-poll log. Tests zero ``gap``."""
 
     def __init__(self, gap: float = AMAZON_MIN_GAP_S, jitter: float = GAP_JITTER,
                  clock=time.monotonic, sleep=time.sleep, uniform=random.uniform):
@@ -166,28 +172,19 @@ class Pacer:
         self.clock, self.sleep, self.uniform = clock, sleep, uniform
         self.last: float | None = None
         self.count = 0
-        self._extra = 0.0
-
-    def defer(self, seconds: float) -> None:
-        """Make the next request wait at least ``seconds`` after the last one."""
-        self._extra = max(self._extra, seconds)
 
     def wait(self) -> None:
-        if self.last is not None:
-            want = self.gap * self.uniform(1 - self.jitter, 1 + self.jitter) if self.gap > 0 else 0.0
-            want = max(want, self._extra)
+        if self.last is not None and self.gap > 0:
+            want = self.gap * self.uniform(1 - self.jitter, 1 + self.jitter)
             left = want - (self.clock() - self.last)
             if left > 0:
                 self.sleep(left)
-        self._extra = 0.0
         self.last = self.clock()
         self.count += 1
 
 
 PACER = Pacer()
 _SESSION = None                       # shared by every Amazon source (cookies persist)
-_FETCHES: dict[str, int] = {}         # source_id -> polls so far (dp_every counting)
-_DP_CACHE: dict[str, Observation] = {}  # source_id -> last good dp buybox
 
 
 def amazon_session():
@@ -205,18 +202,10 @@ def amazon_get(session, url: str, **kwargs):
 
 
 def reset_state() -> None:
-    """Forget the shared session, per-source counters and dp cache (tests)."""
+    """Forget the shared session (tests)."""
     global _SESSION
     _SESSION = None
-    _FETCHES.clear()
-    _DP_CACHE.clear()
 
-
-def _has_amazon_cookies(session) -> bool:
-    try:
-        return any("amazon" in (c.domain or "") for c in session.cookies)
-    except (AttributeError, TypeError):
-        return False
 
 _BROWSER_HEADERS = {
     "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -556,6 +545,79 @@ def parse_listing_id(listing_id: str) -> tuple[str, str]:
     return parts[0], (parts[1] if len(parts) > 1 else "")
 
 
+# The dp's other-offers line: "Comparar outras 3 ofertas a partir de R$4.582,47
+# +R$ 13,22 de envio" (count on accent-folded text; "1 oferta" / "uma oferta"
+# singular, "Novo (3)" in older layouts).
+_INGRESS_SEL = "a#aod-ingress-link"
+_INGRESS_COUNT_RE = re.compile(r"\b(\d+|uma)\s+ofertas?\b|\((\d+)\)")
+_INGRESS_SHIP_RE = re.compile(r"\+?\s*R\$\s*([\d.]+,\d{2})\s*de\s+(?:envio|frete)", re.I)
+_INGRESS_FREE_RE = re.compile(r"\bgratis\b")
+_INGRESS_ASIN_RE = re.compile(r"/offer-listing/([A-Z0-9]{10})")
+# The scope is the link's condition= parameter; the ref token ("dp_olp_NEW_mbc")
+# only stands in when there is none — it precedes the query string, so one
+# pattern for both let a ref like "dp_olp_unknown_mbc" win over condition=NEW.
+_INGRESS_COND_RE = re.compile(r"[?&](?:amp;)?condition=([A-Za-z]+)")
+_INGRESS_REF_SCOPE_RE = re.compile(r"dp_olp_([A-Za-z]+)_")
+_INGRESS_SCOPES = ("ALL", "NEW", "USED")
+# Where the line lives on a product page. A page that has this slot but no
+# line has no other offers (a single-offer listing; Aug 2026 capture); a page
+# without the slot is some other layout and proves nothing.
+_OFFERS_SLOT_SEL = "#olpLinkWidget_feature_div, #all-offers-display"
+
+
+def parse_ingress(page, asin: str | None = None) -> OfferSummary | None:
+    """The product page's "Comparar outras N ofertas a partir de R$ X" line
+    (``#aod-ingress-link``) as an OfferSummary, or None when the page has no
+    such line (a listing with a single offer shows none) or it names no count.
+
+    ``page`` is the parsed soup (or raw HTML). The count is every offer on the
+    ASIN, buybox included; the price is the lowest *card* price among them
+    (2026-10-22: "3 ofertas a partir de R$4.582,47" was the buybox itself) and
+    the shipping is that offer's ("+R$ 13,22 de envio"; GRÁTIS = 0). The ASIN
+    and the condition scope come from the link (``/gp/offer-listing/<ASIN>/
+    ...?condition=ALL``; new-unit pages say NEW), so a page Amazon served for
+    another variation can be told apart from ``asin`` (only the fallback).
+    The scope is ``condition=``, else the ref token (``dp_olp_USED_mbc``),
+    and None unless it is ALL/NEW/USED (a ref such as ``dp_olp_unknown_mbc``
+    names no scope)."""
+    soup = page if hasattr(page, "select_one") else BeautifulSoup(page, "lxml")
+    link = soup.select_one(_INGRESS_SEL)
+    if link is None:
+        return None
+    text = re.sub(r"\s+", " ", link.get_text(" ", strip=True))
+    m = _INGRESS_COUNT_RE.search(_fold(text))
+    if not m:
+        return None
+    n = m.group(1) or m.group(2)
+    count = 1 if n == "uma" else int(n)
+
+    price = None
+    for el in link.select(".a-price"):
+        price = _first_brl(_text(el.select_one(".a-offscreen")))
+        if price is None:   # an empty offscreen: rebuild from the visible parts
+            whole = re.sub(r"\D", "", _text(el.select_one(".a-price-whole")))
+            frac = _text(el.select_one(".a-price-fraction"))
+            price = float(f"{whole}.{frac}") if whole and frac.isdigit() else None
+        if price is not None:
+            break
+    if price is None:      # no price widget: the first R$ that isn't the shipping
+        rest = _BRL_RE.search(_INGRESS_SHIP_RE.sub(" ", text))
+        price = _brl(rest.group(1)) if rest else None
+
+    ship = _INGRESS_SHIP_RE.search(text)
+    shipping = (_brl(ship.group(1)) if ship
+                else 0.0 if _INGRESS_FREE_RE.search(_fold(text)) else None)
+
+    href = link.get("href") or ""
+    am = _INGRESS_ASIN_RE.search(href)
+    sm = _INGRESS_COND_RE.search(href) or _INGRESS_REF_SCOPE_RE.search(href)
+    scope = sm.group(1).upper() if sm else None
+    if scope not in _INGRESS_SCOPES:
+        scope = None
+    return OfferSummary(asin=am.group(1) if am else (asin or ""), offers_total=count,
+                        min_card_price=price, min_shipping=shipping, scope=scope)
+
+
 def aod_block_reason(status: int, html: str) -> str | None:
     """Why an AOD response is unusable (blocked, error page, no offers), or None.
 
@@ -596,7 +658,6 @@ class AmazonSeminovosSource(Source):
     def __init__(self, cfg: dict):
         super().__init__(cfg)
         self.session = amazon_session()
-        self.dp_every = max(int(cfg.get("dp_every", DP_EVERY) or DP_EVERY), 1)
         self.match = {**_DEFAULT_MATCH, **(cfg.get("match") or {})}
         self.asin = cfg.get("asin")
         self.product_url = cfg.get("url") or f"{_HOST}/dp/{self.asin}"
@@ -608,9 +669,13 @@ class AmazonSeminovosSource(Source):
         self.complete = False
         self.degraded: list[str] = []
         self.blocked = False
-        self.block_level: str | None = None   # "soft" | "hard" | None
+        self.block_level: str | None = None   # "hard" | None
         self.notes: list[str] = []   # parse-level problems (missing card price)
-        self.aod_tried = self.aod_ok = 0   # this fetch, for the per-poll log
+        self.aod_tried = self.aod_ok = 0           # this fetch, for the per-poll log
+        self.ingress_tried = self.ingress_ok = 0   # dp requested / offers line read
+        # The dp's "Comparar outras N ofertas" line for this ASIN, or the
+        # no-line marker when the page showed none (set by parse).
+        self.offer_summary: OfferSummary | None = None
 
     # --- orchestration ----------------------------------------------------
 
@@ -628,47 +693,36 @@ class AmazonSeminovosSource(Source):
         self.block_level = None
         self.notes = []
         self.aod_tried = self.aod_ok = 0
-        state = {"tried": False, "ok": False}
+        self.ingress_tried = self.ingress_ok = 0
+        self.offer_summary = None
 
-        n = _FETCHES[self.source_id] = _FETCHES.get(self.source_id, 0) + 1
-        cached = _DP_CACHE.get(self.source_id)
+        # 1. The product page, every poll: buybox + plan + promos + offers line.
+        dp_ok = False
+        self.ingress_tried = 1
+        try:
+            dp, asin = self._fetch_dp(asin)
+            dp_ok = True
+        except Exception as e:  # captcha, HTTP error, no title: Amazon resisting
+            errors.append(f"dp: {e}")
+            self.block_level = "hard"
+        # Only a real line counts as read; the no-line marker doesn't.
+        self.ingress_ok = int(self.offer_summary is not None
+                              and not self.offer_summary.no_line)
 
-        def get_dp() -> None:
-            nonlocal dp, asin
-            state["tried"] = True
-            try:
-                dp, asin = self._fetch_dp(asin)
-                state["ok"] = True
-                if dp is not None:
-                    _DP_CACHE[self.source_id] = dp
-            except Exception as e:  # captcha, HTTP error, no title: Amazon resisting
-                errors.append(f"dp: {e}")
-                self.block_level = "hard"
-
-        dp_due = (not asin                                  # the dp finds the ASIN
-                  or not _has_amazon_cookies(self.session)  # warm the session first
-                  or (n - 1) % self.dp_every == 0
-                  or (cached is not None and cached.coupon > 0))
-        if dp_due:
-            get_dp()
-
+        # 2. The offers panel, once: every seller's card price when Amazon
+        # serves it. From CI it 503s; then the dp + offers line is the whole
+        # picture, which is no reason to back off (module docstring).
         if asin:
             self.aod_tried = 1
-            aod, err = self._fetch_aod_retrying(asin)
-            if aod is not None:
+            try:
+                aod = self._fetch_aod(asin)
                 self.aod_ok = 1
-            else:
-                errors.append(f"aod: {err}")
-                if not state["tried"]:
-                    get_dp()                       # fall back to the buybox
-                # An AOD without offers next to a dp that parsed fine is an
-                # empty listing (sold out), not pushback.
-                if not (state["ok"] and _NO_OFFERS in err) and self.block_level is None:
-                    self.block_level = "soft" if state["ok"] else "hard"
+            except Exception as e:
+                errors.append(f"aod: {e}")
         else:
             errors.append("aod: no ASIN configured")
 
-        if aod is None and not state["ok"]:  # neither the dp nor the AOD gave us anything
+        if aod is None and not dp_ok:  # neither the dp nor the AOD gave us anything
             raise RuntimeError("amazon: " + "; ".join(errors))
         if aod is not None and aod.offers and not any(self._matches(o) for o in aod.offers):
             aod.complete = False  # a panel for some other product never counts
@@ -681,37 +735,17 @@ class AmazonSeminovosSource(Source):
             self.degraded = errors
         self.blocked = self.block_level is not None
         self.complete = aod is not None and aod.complete
-        return self.combine(dp, aod, cached=None if state["tried"] else cached)
+        return self.combine(dp, aod)
 
-    def _fetch_aod_retrying(self, asin: str) -> tuple["AodPage | None", str]:
-        """The AOD, retried once after AOD_RETRY_WAIT_S when Amazon blocked it
-        (an empty listing is not retried). Returns (page or None, error)."""
-        try:
-            return self._fetch_aod(asin), ""
-        except Exception as e:
-            err = str(e)
-        if _NO_OFFERS in err:
-            return None, err
-        print(f"[amazon] {self.source_id}: {err}; retrying the AOD in "
-              f"~{AOD_RETRY_WAIT_S:.0f}s", file=sys.stderr)
-        PACER.defer(AOD_RETRY_WAIT_S)
-        try:
-            return self._fetch_aod(asin), ""
-        except Exception as e:
-            return None, f"{err}; retry: {e}"
-
-    def combine(self, dp: Observation | None, aod: AodPage | None,
-                cached: Observation | None = None) -> list[Observation]:
+    def combine(self, dp: Observation | None, aod: AodPage | None) -> list[Observation]:
         """Merge the dp buybox into the AOD offers; keep target offers, one per
         listing_id: the lowest 12x total wins (``_rank``), and an installment
-        plan on the dropped copy at the same card price is kept. ``cached`` (a
-        previous poll's dp) only lends its plan/promos to the pinned offer at an
-        unchanged card price — it is never stored as an offer itself."""
+        plan on the dropped copy at the same card price is kept."""
         offers: list[Observation] = []
         if aod is not None:
             pinned = aod.pinned if aod.pinned is not None and self._matches(aod.pinned) else None
-            if pinned is not None and (dp or cached) is not None:
-                self._merge_buybox(pinned, dp or cached)
+            if pinned is not None and dp is not None:
+                self._merge_buybox(pinned, dp)
             offers.extend(aod.offers)
             if pinned is None and dp is not None:
                 offers.append(dp)  # AOD showed no (target) buybox; keep the dp one
@@ -814,7 +848,9 @@ class AmazonSeminovosSource(Source):
         return out
 
     def parse(self, url: str, content: bytes) -> Observation | None:
-        """Parse the product page's buybox offer (card + Pix price, plan, seller)."""
+        """Parse the product page's buybox offer (card + Pix price, plan,
+        seller); along the way, its offers line or no-line marker goes to
+        ``offer_summary``."""
         html = content.decode("utf-8", "ignore")
         if any(m in html for m in _CAPTCHA_MARKERS):
             raise RuntimeError("amazon: captcha / bot wall")
@@ -827,6 +863,23 @@ class AmazonSeminovosSource(Source):
         if not self._is_target_title(title):
             return None  # wrong product (other model or the other storage)
 
+        asin_el = soup.select_one("input#ASIN")
+        m = _DP_ASIN_RE.search(url)
+        asin = ((asin_el.get("value") or "").strip() if asin_el else "") \
+            or (m.group(1) if m else "") or self.asin or url.rsplit("/", 1)[-1]
+        # Before the buybox: a page without a buybox price still has the
+        # offers line, and then it is all we know. The no-line marker is the
+        # buybox's own offer, so it waits for the buybox.
+        no_line = self._read_ingress(soup, asin, title)
+        obs = self._parse_buybox(soup, html, url, asin, title)
+        if no_line and obs is not None and self._matches(obs):
+            self._mark_no_line(asin, obs)
+        return obs
+
+    def _parse_buybox(self, soup, html: str, url: str, asin: str,
+                      title: str) -> Observation | None:
+        """The buybox offer of a target product page, or None when it has no
+        usable price."""
         card, shown = self._dp_prices(soup, html)
         pix_pct = self._dp_pix_pct(soup)   # None when no Pix promo is shown
 
@@ -894,10 +947,6 @@ class AmazonSeminovosSource(Source):
             m = _SELLER_ID_RE.search((soup.select_one("#sellerProfileTriggerId") or {})
                                      .get("href", ""))
             seller_id = m.group(1) if m else ""
-        asin_el = soup.select_one("input#ASIN")
-        m = _DP_ASIN_RE.search(url)
-        asin = ((asin_el.get("value") or "").strip() if asin_el else "") \
-            or (m.group(1) if m else "") or self.asin or url.rsplit("/", 1)[-1]
 
         return Observation(
             source_id=self.source_id,
@@ -920,6 +969,46 @@ class AmazonSeminovosSource(Source):
             promos=promos,
             promo_ids=promo_ids,
         )
+
+    def _read_ingress(self, soup, asin: str, title: str) -> bool:
+        """Keep the page's offers line as ``offer_summary`` — only for the
+        configured ASIN: the parent page may have been served for another
+        variation, whose offers aren't ours. A line that is there but can't be
+        read is a layout change worth a partial-fetch note.
+
+        Returns True when the page shows *no* other offers: it is the
+        configured ASIN's page and has the slot the line lives in, but no line
+        (``_OFFERS_SLOT_SEL``). The caller then records the no-line marker
+        once the buybox is known (``_mark_no_line``)."""
+        summary = parse_ingress(soup, asin)
+        if summary is None:
+            if soup.select_one(_INGRESS_SEL) is not None:
+                self.notes.append("dp: offers line unreadable (layout change?)")
+                return False
+            return ((not self.asin or asin == self.asin)
+                    and soup.select_one(_OFFERS_SLOT_SEL) is not None)
+        if self.asin and summary.asin != self.asin:
+            return False
+        summary.storage_gb, summary.color = _storage_gb(title), _find_color(title)
+        summary.source_id = self.source_id
+        self.offer_summary = summary
+        return False
+
+    def _mark_no_line(self, asin: str, buybox: Observation) -> None:
+        """The configured ASIN's page loaded without the other-offers line, so
+        its buybox is the only offer: record that as the no-line marker
+        (``OfferSummary.no_line``) — 1 offer at the buybox's card price, or 0
+        when the buybox is unavailable. It makes the heartbeat drop a line
+        that vanished and tells the 🔍 ladder the hidden offer left. Only ever
+        from a page that parsed with a target buybox: a blocked page raised
+        before getting here, and a page with no buybox price may keep its
+        offers behind "ver todas as opções de compra"."""
+        live = bool(buybox.in_stock)
+        self.offer_summary = OfferSummary(
+            asin=asin, offers_total=int(live),
+            min_card_price=buybox.list_price if live else None,
+            scope=OfferSummary.NO_LINE, storage_gb=buybox.storage_gb,
+            color=buybox.color, source_id=self.source_id)
 
     def _is_target_title(self, title: str | None) -> bool:
         """An S25 Ultra whose storage (first non-RAM size in the title) is the

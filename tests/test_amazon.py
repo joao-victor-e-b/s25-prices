@@ -670,7 +670,7 @@ def test_blocked_only_on_real_pushback(monkeypatch):
         ("aodAjaxMain", _Resp(503, AOD_ERROR_BODY)),
         (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes())),
     ])
-    assert src.blocked is True
+    assert src.degraded and src.blocked is False    # CI's steady state: no backoff
     src, _, _ = _fetch_src(monkeypatch, [
         ("aodAjaxMain", _Resp(200, AOD.read_bytes())),
         (f"/dp/{ASIN}", _Resp(200, CAPTCHA_BODY)),
@@ -869,12 +869,12 @@ def test_bank_wallet_and_multi_unit_coupons_are_conditional():   # A1
         assert not is_conditional_promo(text), text
 
 
-# --- CI rate limiting: pacing, AOD-first, retry (Oct 2026) ----------------------
+# --- CI rate limiting: pacing, dp-first, no AOD retry (Oct 2026) ----------------
 
 from src.sources import amazon as amazon_mod   # noqa: E402
 
 
-def test_pacer_spaces_every_request_and_honours_a_deferred_wait():
+def test_pacer_spaces_every_request():
     t = {"now": 0.0}
     sleeps = []
 
@@ -887,10 +887,11 @@ def test_pacer_spaces_every_request_and_honours_a_deferred_wait():
     pacer.wait()                       # first request: no wait
     t["now"] += 3
     pacer.wait()                       # 3 s later: waits the other 7
-    pacer.defer(45)
-    pacer.wait()                       # the AOD retry: >= 45 s after the last
-    pacer.wait()                       # back to the normal gap
-    assert sleeps == [7.0, 45.0, 10.0] and pacer.count == 4
+    pacer.wait()                       # right after: the full gap
+    t["now"] += 30
+    pacer.wait()                       # long since the last one: no wait
+    assert sleeps == [7.0, 10.0] and pacer.count == 4
+    assert not hasattr(pacer, "defer")  # the 45 s AOD-retry wait is gone
     jittery = amazon_mod.Pacer(gap=10, jitter=0.3, clock=lambda: 0.0, sleep=sleeps.append,
                                uniform=lambda a, b: b)
     jittery.wait()
@@ -898,10 +899,8 @@ def test_pacer_spaces_every_request_and_honours_a_deferred_wait():
     assert sleeps[-1] == 13.0          # 10 s + 30%
 
 
-def _routed_session(monkeypatch, routes, calls, warm=True):
+def _routed_session(monkeypatch, routes, calls):
     session = amazon_mod.amazon_session()
-    if warm:
-        session.cookies.set("session-id", "1", domain=".amazon.com.br")
 
     def get(url, headers=None, timeout=None):
         calls.append(url)
@@ -917,82 +916,50 @@ def _kinds(calls):
     return ["aod" if "aodAjaxMain" in u else "dp" for u in calls]
 
 
-def test_aod_first_dp_every_4th_poll_and_plan_cached(monkeypatch):
+def test_dp_first_then_one_aod_every_poll(monkeypatch):
     calls = []
     _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
                                   (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
-    kinds = []
-    for _ in range(5):
+    for _ in range(4):
         calls.clear()
-        obs = _src().fetch()           # a new source object each poll, like run.poll
-        kinds.append(_kinds(calls))
+        src = _src()                   # a new source object each poll, like run.poll
+        obs = src.fetch()
+        assert _kinds(calls) == ["dp", "aod"]
         cs = next(o for o in obs if o.listing_id == f"{ASIN}:{CELLULAR}:excelente")
-        assert (cs.installments_n, cs.installment_value) == (12, 381.90)   # cached plan
-        assert len(obs) == 3                                               # dp never stored
-    assert kinds == [["dp", "aod"], ["aod"], ["aod"], ["aod"], ["dp", "aod"]]
-    assert amazon_mod.PACER.count == 7                                     # all paced
+        assert (cs.installments_n, cs.installment_value) == (12, 381.90)   # this poll's dp
+        assert len(obs) == 3
+        assert (src.ingress_ok, src.ingress_tried) == (1, 1)
+        assert src.offer_summary.offers_total == 3
+    assert amazon_mod.PACER.count == 8                                     # all paced
 
 
-def test_cached_plan_only_lends_itself_at_an_unchanged_price(monkeypatch):
+def test_no_plan_survives_from_an_earlier_poll(monkeypatch):
+    # the dp used to be cached between polls; now a blocked dp lends nothing
     calls = []
-    aod = {"body": AOD.read_bytes()}
-    _routed_session(monkeypatch, [("aodAjaxMain", lambda: _Resp(200, aod["body"])),
-                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
-    _src().fetch()
-    aod["body"] = AOD.read_bytes().replace(b"4.582,47", b"4.499,00")
-    assert aod["body"] != AOD.read_bytes()
-    obs = _src().fetch()               # buybox price moved: the old plan is stale
-    cs = next(o for o in obs if o.listing_id == f"{ASIN}:{CELLULAR}:excelente")
-    assert cs.list_price == 4499.0 and cs.installments_n is None
-
-
-def test_dp_every_poll_while_it_shows_a_coupon(monkeypatch):
-    calls = []
-    dp = re.sub(rb'(<div id="couponsInBuybox_feature_div"[^>]*>)',
-                rb"\1Economize R$ 100,00 com cupom", DP_PIX.read_bytes(), count=1)
-    assert dp != DP_PIX.read_bytes()
+    dp = {"resp": _Resp(200, DP_PIX.read_bytes())}
     _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
-                                  (f"/dp/{ASIN}", _Resp(200, dp))], calls)
-    for _ in range(3):
-        calls.clear()
-        _src().fetch()
-        assert _kinds(calls) == ["dp", "aod"]      # the coupon moves the 12x total
-
-
-def test_cold_session_fetches_the_dp_first(monkeypatch):
-    calls = []
-    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
-                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))],
-                    calls, warm=False)
-    amazon_mod._FETCHES["amazon_seminovos"] = 1     # not a dp_every turn
+                                  (f"/dp/{ASIN}", lambda: dp["resp"])], calls)
     _src().fetch()
-    assert _kinds(calls) == ["dp", "aod"]
+    dp["resp"] = _Resp(200, CAPTCHA_BODY)
+    src = _src()
+    obs = src.fetch()
+    assert all(o.installments_n is None for o in obs) and len(obs) == 3
+    assert src.block_level == "hard" and src.offer_summary is None
 
 
-def test_blocked_aod_is_retried_once_after_a_long_wait(monkeypatch):
+def test_blocked_aod_is_tried_once_and_is_not_trouble(monkeypatch):
     calls, sleeps = [], []
     monkeypatch.setattr(amazon_mod, "PACER", amazon_mod.Pacer(
         gap=0, clock=lambda: 0.0, sleep=sleeps.append))
-    answers = [_Resp(503, AOD_ERROR_BODY), _Resp(200, AOD.read_bytes())]
-    _routed_session(monkeypatch, [("aodAjaxMain", lambda: answers.pop(0)),
-                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
-    amazon_mod._FETCHES["amazon_seminovos"] = 1
-    src = _src()
-    obs = src.fetch()
-    assert _kinds(calls) == ["aod", "aod"] and sleeps == [amazon_mod.AOD_RETRY_WAIT_S]
-    assert len(obs) == 3 and src.block_level is None and src.aod_ok == 1
-
-
-def test_aod_blocked_twice_falls_back_to_the_dp_as_soft_trouble(monkeypatch):
-    calls = []
     _routed_session(monkeypatch, [("aodAjaxMain", _Resp(503, AOD_ERROR_BODY)),
                                   (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
-    amazon_mod._FETCHES["amazon_seminovos"] = 1
     src = _src()
     (o,) = src.fetch()
-    assert _kinds(calls) == ["aod", "aod", "dp"]
+    assert _kinds(calls) == ["dp", "aod"] and sleeps == []       # no retry, no long wait
     assert o.listing_id == f"{ASIN}:{CELLULAR}:excelente" and o.installments_n == 12
-    assert (src.block_level, src.blocked, src.aod_ok, src.aod_tried) == ("soft", True, 0, 1)
+    assert (src.block_level, src.blocked, src.aod_ok, src.aod_tried) == (None, False, 0, 1)
+    assert src.offer_summary.offers_total == 3 and src.ingress_ok == 1
+    assert src.degraded and src.complete is False    # still a partial fetch for the log
 
 
 def test_empty_listing_is_not_retried_and_not_trouble(monkeypatch):
@@ -1000,10 +967,9 @@ def test_empty_listing_is_not_retried_and_not_trouble(monkeypatch):
     empty = b"<html><body><div id='aod-container'></div></body></html>"
     _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, empty)),
                                   (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
-    amazon_mod._FETCHES["amazon_seminovos"] = 1
     src = _src()
     src.fetch()
-    assert _kinds(calls) == ["aod", "dp"] and src.block_level is None
+    assert _kinds(calls) == ["dp", "aod"] and src.block_level is None
 
 
 def test_dp_captcha_is_hard_trouble(monkeypatch):
@@ -1012,6 +978,7 @@ def test_dp_captcha_is_hard_trouble(monkeypatch):
                                   (f"/dp/{ASIN}", _Resp(200, CAPTCHA_BODY))], calls)
     src = _src()
     assert len(src.fetch()) == 3 and src.block_level == "hard"
+    assert (src.ingress_ok, src.ingress_tried) == (0, 1)
 
 
 def test_promo_terms_go_through_the_pacer(monkeypatch):
@@ -1025,3 +992,182 @@ def test_promo_terms_go_through_the_pacer(monkeypatch):
     before = amazon_mod.PACER.count
     assert promo_terms(S(), "A3N43RG5YNRVDU") == "Até R$ 50"
     assert amazon_mod.PACER.count == before + 1
+
+
+# --- the dp's other-offers line (#aod-ingress-link), CI's view of the panel --------
+
+from src.sources.amazon import parse_ingress   # noqa: E402
+
+
+def _ingress(inner: str, href: str = f"/gp/offer-listing/{ASIN}/ref=dp_olp_ALL_mbc"
+                                     "?ie=UTF8&amp;condition=ALL") -> str:
+    return (f"<div id='dynamic-aod-ingress-box'><a id='aod-ingress-link' href='{href}'>"
+            f"{inner}</a></div>")
+
+
+def _fields(s):
+    return (s.asin, s.offers_total, s.min_card_price, s.min_shipping, s.scope)
+
+
+def test_ingress_parsed_from_the_real_dp():
+    src = _src()
+    src.parse(URL, DP_PIX.read_bytes())
+    s = src.offer_summary
+    # "Comparar outras 3 ofertas a partir de R$4.582,47 +R$&nbsp;13,22 de envio"
+    assert _fields(s) == (ASIN, 3, 4582.47, 13.22, "ALL")
+    assert (s.storage_gb, s.color, s.source_id) == (256, "preto", "amazon_seminovos")
+    assert s.min_total == 4595.69                  # what the 🔍 alert compares
+    assert src.notes == []
+
+
+def test_ingress_variants():
+    one = parse_ingress(_ingress(
+        "<span>Comparar 1 oferta a partir de</span> <span class='a-price'>"
+        "<span class='a-offscreen'>R$3.899,00</span></span> "
+        "<span class='a-color-secondary'>Frete GRÁTIS</span>"))
+    assert _fields(one) == (ASIN, 1, 3899.0, 0.0, "ALL")      # singular, free shipping
+    assert one.min_total == 3899.0
+    no_price = parse_ingress(_ingress("<span>Comparar outras 4 ofertas</span>"))
+    assert _fields(no_price) == (ASIN, 4, None, None, "ALL")
+    assert no_price.min_total is None
+    new = parse_ingress(_ingress(
+        "Comparar outras 5 ofertas a partir de R$ 5.799,00 +R$\xa025,00 de envio",
+        href="/gp/offer-listing/B0DSYJCY45/ref=dp_olp_NEW_mbc?ie=UTF8&amp;condition=NEW"))
+    assert _fields(new) == ("B0DSYJCY45", 5, 5799.0, 25.0, "NEW")   # text-only price
+    split = parse_ingress(_ingress(
+        "Comparar uma oferta a partir de <span class='a-price'><span class='a-offscreen'>"
+        "</span><span class='a-price-whole'>3.700<span class='a-price-decimal'>,</span>"
+        "</span><span class='a-price-fraction'>00</span></span>",
+        href=f"/gp/offer-listing/{ASIN}/ref=dp_olp_USED_mbc"))
+    assert _fields(split) == (ASIN, 1, 3700.0, None, "USED")       # scope from the ref
+    old = parse_ingress(_ingress("Novo (3) a partir de R$ 4.100,00", href="/x"),
+                        asin="B0FALLBACK")
+    assert _fields(old) == ("B0FALLBACK", 3, 4100.0, None, None)
+    assert parse_ingress("<html><body>nada</body></html>") is None   # no line at all
+    assert parse_ingress(_ingress("Ver outras ofertas")) is None      # no count
+
+
+def test_ingress_scope_is_the_condition_parameter_not_the_ref():
+    line = "Comparar outras 5 ofertas a partir de R$ 5.799,00"
+
+    def scope(href):
+        return parse_ingress(_ingress(line, href=href)).scope
+    # the ref path comes before the query string: it used to win
+    assert scope("/gp/offer-listing/B0DSYJCY45/ref=dp_olp_unknown_mbc"
+                 "?ie=UTF8&amp;condition=NEW") == "NEW"
+    assert scope(f"/gp/offer-listing/{ASIN}/ref=dp_olp_ALL_mbc"
+                 "?ie=UTF8&amp;condition=USED") == "USED"
+    assert scope(f"/gp/offer-listing/{ASIN}/ref=dp_olp_ALL_mbc"
+                 "?ie=UTF8&condition=new") == "NEW"                      # raw &, lower case
+    # no condition=: the ref token stands in, but only for a real scope
+    assert scope(f"/gp/offer-listing/{ASIN}/ref=dp_olp_USED_mbc") == "USED"
+    assert scope(f"/gp/offer-listing/{ASIN}/ref=dp_olp_unknown_mbc") is None
+    assert scope(f"/gp/offer-listing/{ASIN}/ref=x?condition=refurbished") is None
+
+
+# --- a product page without the line: the no-line marker -------------------------
+
+def test_page_without_the_line_is_a_no_line_marker():
+    # Aug 2026 capture: the other-offers slot is there, the line isn't — the
+    # CellularStore buybox was the only offer
+    src = _src()
+    o = src.parse(URL, FIXTURE.read_bytes())
+    s = src.offer_summary
+    assert _fields(s) == (ASIN, 1, 4582.47, None, "NONE") and s.no_line
+    assert s.min_card_price == o.list_price and s.min_total == 4582.47
+    assert (s.storage_gb, s.color, s.source_id) == (256, "preto", "amazon_seminovos")
+    assert src.notes == []
+
+
+def _no_line_page(asin=ASIN, slot=True, available=True) -> bytes:
+    raw = FIXTURE.read_bytes()
+    if asin != ASIN:
+        raw = raw.replace(f'value="{ASIN}"'.encode(), f'value="{asin}"'.encode())
+    if not slot:
+        raw = raw.replace(b'id="olpLinkWidget_feature_div"', b'id="x1"')
+        raw = raw.replace(b'id="all-offers-display"', b'id="x2"')
+    if not available:
+        raw = raw.replace(b'id="availability"', b'id="availability-old"')
+        raw = re.sub(rb"(<body[^>]*>)", lambda m: m.group(1) + "<div id='availability'>"
+                     "Indisponível</div>".encode(), raw, count=1)
+    return raw
+
+
+def test_no_line_marker_needs_our_page_its_slot_and_a_buybox():
+    src = _src()
+    assert src.parse(URL, _no_line_page(asin="B0OTHERCHL")) is not None
+    assert src.offer_summary is None                 # another variation's page
+    src = _src()
+    src.parse(URL, _no_line_page(slot=False))
+    assert src.offer_summary is None                 # some other layout: proves nothing
+    src = _src()                                     # slot, no line, no buybox price
+    no_buybox = (b"<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto</span>"
+                 b"<div id='olpLinkWidget_feature_div'></div></body></html>")
+    assert src.parse(URL, no_buybox) is None
+    assert src.offer_summary is None                 # offers may sit behind a button
+    src = _src()
+    o = src.parse(URL, _no_line_page(available=False))
+    assert o.in_stock is False
+    assert _fields(src.offer_summary) == (ASIN, 0, None, None, "NONE")   # nothing to buy
+
+
+def test_blocked_dp_never_writes_a_no_line_marker(monkeypatch):
+    calls = []
+    for body in (CAPTCHA_BODY, b"<html><body>Erro</body></html>"):   # captcha / no title
+        _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+                                      (f"/dp/{ASIN}", _Resp(200, body))], calls)
+        src = _src()
+        assert src.fetch() and src.block_level == "hard"
+        assert src.offer_summary is None and (src.ingress_ok, src.ingress_tried) == (0, 1)
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+                                  (f"/dp/{ASIN}", _Resp(503, b"busy"))], calls)
+    src = _src()
+    src.fetch()
+    assert src.block_level == "hard" and src.offer_summary is None
+
+
+def test_fetch_keeps_the_marker_but_does_not_count_it_as_a_line(monkeypatch):
+    calls = []
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(503, AOD_ERROR_BODY)),
+                                  (f"/dp/{ASIN}", _Resp(200, FIXTURE.read_bytes()))], calls)
+    src = _src()
+    (o,) = src.fetch()
+    assert src.offer_summary.no_line and src.offer_summary.offers_total == 1
+    assert (src.ingress_ok, src.ingress_tried) == (0, 1)     # no line read
+    assert src.block_level is None
+
+
+def test_unreadable_line_is_a_partial_fetch_note():
+    html = ("<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto</span>"
+            + _ingress("Ver outras ofertas") + "</body></html>").encode()
+    src = _src()
+    src.parse(URL, html)
+    assert src.offer_summary is None
+    assert any("offers line unreadable" in n for n in src.notes)
+
+
+def test_line_read_even_without_a_buybox_price():
+    # no featured offer: the line is all we know, so it must not be skipped
+    html = ("<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto</span>"
+            + _ingress("Comparar outras 2 ofertas a partir de R$ 3.850,00")
+            + "</body></html>").encode()
+    src = _src()
+    assert src.parse(URL, html) is None
+    assert _fields(src.offer_summary) == (ASIN, 2, 3850.0, None, "ALL")
+
+
+def test_line_of_another_variation_is_ignored():
+    html = ("<html><body><span id='productTitle'>Galaxy S25 Ultra 256GB Preto</span>"
+            + _ingress("Comparar outras 2 ofertas a partir de R$ 3.850,00",
+                       href="/gp/offer-listing/B0OTHERCHL/ref=dp_olp_ALL_mbc")
+            + "</body></html>").encode()
+    src = _src()
+    src.parse(URL, html)
+    assert src.offer_summary is None
+
+
+def test_512_line_belongs_to_the_512_source():
+    src = _src_512()
+    src.parse(URL_512, _as_512(DP_PIX.read_bytes()))
+    assert _fields(src.offer_summary) == (ASIN_512, 3, 4582.47, 13.22, "ALL")
+    assert src.offer_summary.storage_gb == 512

@@ -15,7 +15,7 @@ With the repo public, Actions minutes are free, so one job runs ``loop`` for
 ~6 hours, polling every ~4 minutes (with jitter, backing off when Amazon
 pushes back) and committing the DB every 30 minutes (gitsync.py); the next
 scheduled run is already queued behind it. A registry entry with ``every: N``
-is polled on every Nth loop iteration only (the four new-unit ASINs use 2), so
+is polled on every Nth loop iteration only (the four new-unit ASINs use 3), so
 one poll never fetches more than ~6 ASINs.
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ from . import (
     triggers,
 )
 from .cdi import get_cdi_monthly
-from .models import Observation
+from .models import Observation, OfferSummary
 from .normalize import apply_cashback, card_total, finalize, pix_price, pv
 from .sources import amazon as amazon_mod
 from .sources import is_enabled, load_source
@@ -77,10 +77,12 @@ def poll(daily: bool = False, enable_new_low: bool = False,
     ``iteration`` (the loop's poll number) staggers ``every: N`` sources.
 
     Result keys: polled, failures, partial, observations, stored, alerts,
-    amazon_block ("hard": an Amazon source raised or its product page was
-    blocked; "soft": only the offers panel was blocked; None: clean or just an
-    empty listing — the loop backs off by level), amazon_trouble (= a level is
-    set), requests and aod_ok/aod_tried (logged per poll and in run_log).
+    unseen_alerts (🔍), amazon_block ("hard": an Amazon source raised or its
+    product page was blocked; None otherwise — a blocked offers panel next to
+    a good product page is CI's steady state, not pushback), amazon_trouble
+    (= a level is set; the loop backs off on it), requests, aod_ok/aod_tried
+    and ingress_ok/ingress_tried (product pages whose offers line was read /
+    requested; logged per poll and at the start of run_log.detail).
     """
     if scan_coupons is None:
         scan_coupons = scan_promos
@@ -100,9 +102,11 @@ def poll(daily: bool = False, enable_new_low: bool = False,
 
         polled = failures = partial = stored = 0
         problems: list[str] = []   # run_log detail: failed + degraded sources
+        notes: list[str] = []      # run_log detail: record-only facts (offer counts up)
         observations: list[Observation] = []
-        block: str | None = None   # worst Amazon pushback this poll
-        aod_ok = aod_tried = 0
+        summaries: list[OfferSummary] = []   # product pages' offers lines
+        block: str | None = None   # Amazon pushback this poll ("hard" or None)
+        aod_ok = aod_tried = ingress_ok = ingress_tried = 0
         req0 = amazon_mod.PACER.count
 
         # daily runs sweep all tiers; otherwise cap at max_tier.
@@ -122,19 +126,29 @@ def poll(daily: bool = False, enable_new_low: bool = False,
                 if is_amazon:
                     block = "hard"
                     aod_tried += getattr(src, "aod_tried", 0)
+                    ingress_tried += getattr(src, "ingress_tried", 0)
                 problems.append(f"{cfg['id']}: {e}"[:200])
                 print(f"[fetch-fail] {cfg['id']}: {e}", file=sys.stderr)
                 continue
             if is_amazon:
                 aod_ok += getattr(src, "aod_ok", 0)
                 aod_tried += getattr(src, "aod_tried", 0)
+                ingress_ok += getattr(src, "ingress_ok", 0)
+                ingress_tried += getattr(src, "ingress_tried", 0)
             if getattr(src, "degraded", None):
                 partial += 1
-                if is_amazon:
-                    level = getattr(src, "block_level", None) or (
-                        "hard" if getattr(src, "blocked", True) else None)
-                    block = _worse(block, level)
+                # A source without the attributes counts as blocked (safe side).
+                if is_amazon and (getattr(src, "block_level", None)
+                                  or getattr(src, "blocked", True)):
+                    block = "hard"
                 problems.append(f"{cfg['id']} partial: {'; '.join(src.degraded)}"[:200])
+            summary = getattr(src, "offer_summary", None)
+            if summary is not None:
+                summary.ts = now
+                note = _record_offer_summary(conn, summary)
+                if note:
+                    notes.append(note)
+                summaries.append(summary)
             for o in offers:
                 o.ts = now
                 apply_cashback(o)
@@ -155,6 +169,8 @@ def poll(daily: bool = False, enable_new_low: bool = False,
 
         alerts = triggers.evaluate(conn, observations, now, enable_new_low=enable_new_low)
         _send_alerts(conn, alerts, now, dry_run)
+        unseen = triggers.unseen_offers(conn, summaries, observations, now)
+        _send_unseen_alerts(conn, unseen, now, dry_run)
         _offer_promo_alerts(conn, observations, now, dry_run)
 
         # --- Phase 4b: promotions + coupons (best-effort; never break the poll) ---
@@ -165,27 +181,44 @@ def poll(daily: bool = False, enable_new_low: bool = False,
             coupon_errors = _scan_coupons(conn, now, dry_run, observations)
 
         requests_made = amazon_mod.PACER.count - req0
-        stats = f"aod_ok={aod_ok}/{aod_tried} req={requests_made}"
-        print(f"[amazon] requests={requests_made} aod_ok={aod_ok}/{aod_tried}"
+        stats = (f"aod_ok={aod_ok}/{aod_tried} req={requests_made} "
+                 f"ingress={ingress_ok}/{ingress_tried}")
+        print(f"[amazon] requests={requests_made} aod_ok={aod_ok}/{aod_tried} "
+              f"ingress={ingress_ok}/{ingress_tried}"
               + (f" backoff={block}" if block else ""), file=sys.stderr)
         store.insert_run_log(conn, now, polled, failures, partial, coupon_errors,
-                             " | ".join([stats] + problems))
+                             " | ".join([stats] + notes + problems))
         conn.commit()
     finally:
         conn.close()   # uncommitted work (a crash mid-poll) is rolled back
     result = {"polled": polled, "failures": failures, "partial": partial,
               "observations": len(observations), "stored": stored,
-              "alerts": len(alerts), "amazon_trouble": block is not None,
+              "alerts": len(alerts), "unseen_alerts": len(unseen),
+              "amazon_trouble": block is not None,
               "amazon_block": block, "requests": requests_made,
-              "aod_ok": aod_ok, "aod_tried": aod_tried}
+              "aod_ok": aod_ok, "aod_tried": aod_tried,
+              "ingress_ok": ingress_ok, "ingress_tried": ingress_tried}
     print(f"[poll] {result}")
     return result
 
 
-def _worse(a: str | None, b: str | None) -> str | None:
-    """The harder of two Amazon pushback levels (None < soft < hard)."""
-    order = {None: 0, "soft": 1, "hard": 2}
-    return a if order[a] >= order[b] else b
+def _record_offer_summary(conn, s: OfferSummary) -> str | None:
+    """Store an offers line or no-line marker (change-only + hourly,
+    store.insert_offer_summary) and return a run-log note when its offer
+    count went up since the ASIN's last stored reading at the same scope —
+    a no-line marker matches any scope, so a line appearing next to a lone
+    buybox (1 -> 2) is noted too. Record-only on purpose: a new seller alone
+    says nothing about price — the 🔍 alert covers a cheaper one."""
+    prev = store.last_offer_summary(conn, s.asin, s.ts)
+    store.insert_offer_summary(conn, s)
+    if prev is None or prev["offers_total"] is None or s.offers_total <= prev["offers_total"]:
+        return None
+    if prev["scope"] != s.scope and OfferSummary.NO_LINE not in (prev["scope"], s.scope):
+        return None
+    low = f" from {s.min_card_price:.2f}" if s.min_card_price is not None else ""
+    note = f"{s.asin} offers {prev['offers_total']}->{s.offers_total}{low}"
+    print(f"[offers] {note}")
+    return note
 
 
 def _recent_codes(conn, now: str, days: int = 2) -> dict[str, coupons_mod.CouponCode]:
@@ -257,6 +290,26 @@ def _send_alerts(conn, alerts: list, now: str, dry_run: bool) -> None:
               f"ntfy_ok={report['ntfy_ok']}")
     else:
         print("[alerts] none")
+
+
+def _send_unseen_alerts(conn, alerts: list, now: str, dry_run: bool) -> None:
+    """Send 🔍 alerts (triggers.unseen_offers). Like ``_send_alerts``: the
+    ladder state (alerts_sent under ``unseen:<ASIN>``, metric = card +
+    shipping) is written only for alerts a channel delivered, and a dry run
+    prints and writes nothing."""
+    if not alerts:
+        return
+    if dry_run:
+        print(f"[dry-run] {len(alerts)} unseen-offer alert(s) would send:")
+        for a in alerts:
+            print("  " + notify.format_unseen_offer(a).replace("\n", " | "))
+        return
+    report = notify.notify_unseen(alerts)
+    for i in report.get("delivered", []):
+        a = alerts[i]
+        store.record_alert(conn, a.key, a.trigger, a.metric, now)
+    print(f"[unseen] sent={report['sent']} wa_ok={report['wa_ok']} "
+          f"ntfy_ok={report['ntfy_ok']}")
 
 
 def _promo_key(asin: str, seller_id: str, message: str) -> str:
@@ -538,6 +591,31 @@ def _codes_to_try(conn, best: Observation | None, now: str,
     return out
 
 
+def _offer_lines(conn, now: str, registry: list[dict],
+                 days: int = 2) -> list[tuple[str, int, float | None]]:
+    """(label, offers_total, min_card_price) for the heartbeat's "Ofertas:"
+    line: the latest reading (last ``days``) of each registry ASIN, in
+    registry order, labelled by its storage. A no-line marker reads as what
+    it is — the buybox alone ("1", its price; "0" when unavailable) — so a
+    vanished line isn't reported for two more days. New-unit listings
+    (``default_grade: Novo``, or a line scoped NEW) are left out: the line is
+    about the seminovo listings, where the panel the server can't read hides
+    sellers."""
+    since = (datetime.fromisoformat(now) - timedelta(days=days)).isoformat()
+    latest = store.latest_offer_summaries(conn, since)
+    out = []
+    for cfg in registry:
+        if str(cfg.get("default_grade") or "").lower() == "novo":
+            continue
+        row = latest.get(cfg.get("asin") or "")
+        if row is None or row["scope"] == "NEW" or row["offers_total"] is None:
+            continue
+        gb = (cfg.get("match") or {}).get("storage_gb")
+        out.append((f"{gb}GB" if gb else row["asin"], row["offers_total"],
+                    row["min_card_price"]))
+    return out
+
+
 def _heartbeat_message(conn, now: str) -> str:
     best = _best_amazon_offer(conn, now)
     try:
@@ -545,8 +623,15 @@ def _heartbeat_message(conn, now: str) -> str:
     except Exception as e:  # the heartbeat itself must always go out
         print(f"[heartbeat] code hint failed: {e}", file=sys.stderr)
         hint = []
-    sources = sum(1 for c in load_registry() if load_source(c) is not None)
-    return notify.format_heartbeat(best, hint, sources, store.run_log_totals(conn, now))
+    registry = load_registry()
+    sources = sum(1 for c in registry if load_source(c) is not None)
+    try:
+        offers = _offer_lines(conn, now, registry)
+    except Exception as e:  # never let the extra line stop the heartbeat
+        print(f"[heartbeat] offers line failed: {e}", file=sys.stderr)
+        offers = []
+    return notify.format_heartbeat(best, hint, sources, store.run_log_totals(conn, now),
+                                   offers=offers)
 
 
 def heartbeat() -> dict:
@@ -565,10 +650,8 @@ def heartbeat() -> dict:
 
 SYNC_EVERY_S = 1800        # commit + push the DB this often (and on exit)
 EXIT_SYNC_BUDGET_S = 180   # the budget exit syncs normally (retries) within this
-MAX_BACKOFF_S = 1200       # hard pushback (dp blocked) doubles the sleep up to 20 min
-SOFT_BACKOFF = 1.5         # soft pushback (only the AOD blocked): x1.5 ...
-SOFT_BACKOFF_S = 720       # ... up to 12 min
-JITTER = (0.8, 1.2)        # ±20% so polls don't land on a fixed beat
+MAX_BACKOFF_S = 1200       # pushback (dp blocked / a source raised) doubles the sleep up to 20 min
+JITTER = (0.8, 1.2)       # ±20% so polls don't land on a fixed beat
 MAX_ERRORS_IN_A_ROW = 5    # a poll that keeps crashing ends the run (visible in CI)
 
 
@@ -613,10 +696,11 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
     """Poll repeatedly until ``minutes`` would be exceeded.
 
     - sleep ``interval`` seconds ±20% between polls; when Amazon pushed back
-      grow it — hard (a source raised, product page blocked/captcha): x2 up to
-      MAX_BACKOFF_S; soft (only the offers panel blocked): x1.5 up to
-      SOFT_BACKOFF_S — and go back to ``interval`` after a clean poll (an
-      empty listing is not pushback);
+      (a source raised, product page blocked/captcha) double it up to
+      MAX_BACKOFF_S, and go back to ``interval`` after a poll without
+      pushback. A blocked or empty offers panel next to a good product page
+      is not pushback: from CI that panel always 503s (amazon.py), and
+      backing off on it only slowed every poll to 12-17 min for nothing;
     - the coupon/cashback sweep runs on the first poll and then at most every
       ``coupon_every`` seconds; the DuckDuckGo deal scan stays off;
     - CDI is fetched once for the whole loop; each poll gets its iteration
@@ -669,13 +753,7 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
             took = clock() - t0
 
             trouble = level is not None
-            soft_cap = max(SOFT_BACKOFF_S, interval)
-            if level == "hard":
-                base = min(base * 2, cap)
-            elif level == "soft":
-                base = min(base * SOFT_BACKOFF, soft_cap)
-            else:
-                base = interval
+            base = min(base * 2, cap) if trouble else interval
             if git_sync and clock() - last_sync >= SYNC_EVERY_S:
                 try:
                     sync_fn()
@@ -686,7 +764,7 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
 
             wait = base * uniform(*JITTER)
             if trouble:
-                wait = min(wait, cap if level == "hard" else soft_cap)
+                wait = min(wait, cap)
             if clock() + wait + took > deadline:
                 print(f"[loop] {polls} poll(s); time budget reached, stopping")
                 budget_exit = True

@@ -20,7 +20,7 @@ import requests
 
 from . import config
 from .normalize import card_total, pix_price
-from .triggers import Alert
+from .triggers import PRIORITY, Alert, UnseenOfferAlert
 
 _CALLMEBOT_URL = "https://api.callmebot.com/whatsapp.php"
 _NTFY_BASE = "https://ntfy.sh"
@@ -201,12 +201,48 @@ def notify(alerts: list[Alert]) -> dict:
     return _deliver([format_alert(a) for a in alerts], "S25 Ultra deal")
 
 
+_AMAZON_DP = "https://www.amazon.com.br/dp/"
+
+
+def format_unseen_offer(a: UnseenOfferAlert) -> str:
+    """🔍: the product page's offers line shows a price below every offer we
+    could name (seller and condition unknown from the server). Headline with
+    the price as paid (card + shipping) and its 12x share, then the level it
+    reaches, how the price splits and what we did see, and the ASIN link."""
+    s = a.summary
+    storage = f"{s.storage_gb}GB" if s.storage_gb else ""
+    what = " ".join(x for x in (storage, s.color or "", "novo" if s.scope == "NEW" else "")
+                    if x)
+    lines = [f"{a.priority} Amazon {what}: oferta a partir de {money(a.metric)} "
+             f"(12x ≈ {money(round(a.metric / 12, 2))}) — vendedor/condição não "
+             f"visíveis do servidor, confira"]
+    details = [f"nível {PRIORITY[a.level]} {_HEADLINES[a.level]}"]
+    if s.min_shipping:
+        details.append(f"{money(s.min_card_price)} + {money(s.min_shipping)} de envio")
+    seen = f"{a.attributed} identificada{'s' if a.attributed != 1 else ''}"
+    if a.attributed_min is not None:
+        seen += f" (menor {money(a.attributed_min)})"
+    details.append(f"{s.offers_total} oferta{'s' if s.offers_total != 1 else ''}, {seen}")
+    lines.append(" · ".join(details))
+    lines.append(_AMAZON_DP + s.asin)
+    return "\n".join(lines)
+
+
+def notify_unseen(alerts: list[UnseenOfferAlert]) -> dict:
+    """Send 🔍 alerts, batched, WhatsApp + ntfy (``delivered`` per alert)."""
+    return _deliver([format_unseen_offer(a) for a in alerts], "S25 oferta oculta")
+
+
 def format_heartbeat(best, code_hint: list[tuple[str, float]] | tuple[str, float] | None,
-                     sources: int, totals) -> str:
+                     sources: int, totals,
+                     offers: list[tuple[str, int, float | None]] | None = None) -> str:
     """Daily summary making silent scraper decay visible (spec §7), Amazon
-    only: the best eligible offer's 12x total and Pix price, one unvalidated
-    code worth trying, and the last 24h of polls/failures (``totals`` is a
-    ``store.run_log_totals`` row or a dict with the same keys)."""
+    only: the best eligible offer's 12x total and Pix price, the offers lines
+    (``offers``: (label, offers_total, min_card_price) per listing, from
+    offer_summary — how many offers exist beyond the ones the server can
+    name), one unvalidated code worth trying, and the last 24h of
+    polls/failures (``totals`` is a ``store.run_log_totals`` row or a dict
+    with the same keys)."""
     if best is None:
         lines = ["📊 S25 Amazon — sem oferta Excelente+ em estoque (48h)"]
     else:
@@ -218,7 +254,11 @@ def format_heartbeat(best, code_hint: list[tuple[str, float]] | tuple[str, float
                                      best.grade_raw or "") if x)
         coupon = coupon_line(best)
         lines.append(f"{who} · {coupon}" if coupon else who)
-    hints = [code_hint] if isinstance(code_hint, tuple) else list(code_hint or [])
+    if offers:
+        lines.append("Ofertas: " + " · ".join(
+            f"{label} {n}" + (f" (menor {money(low)})" if low is not None else "")
+            for label, n, low in offers))
+    hints =[code_hint] if isinstance(code_hint, tuple) else list(code_hint or [])
     if hints:
         code, value = hints[0]
         more = (f" (+ {', '.join(safe_text(c) for c, _ in hints[1:])})"

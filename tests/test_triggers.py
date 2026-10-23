@@ -267,3 +267,172 @@ def test_year_low_level_between_good_and_2026_low(conn):
     assert [a.trigger for a in alerts] == ["year_low"]
     assert alerts[0].priority == "🟡"
     assert triggers.evaluate(conn, [_obs(3950.0, listing_id="L2")], now) == []
+
+
+# --- 🔍 unseen offer: the dp's offers line undercuts every attributed offer ---------
+
+from src.models import OfferSummary   # noqa: E402
+
+ASIN = "B0FTMWWS8Y"
+
+
+def _line(price, shipping=None, asin=ASIN, n=4, ts=NOW):
+    return OfferSummary(asin=asin, offers_total=n, min_card_price=price,
+                        min_shipping=shipping, scope="ALL", ts=ts, storage_gb=512,
+                        color="preto")
+
+
+def _named(price, seller="A3SPPFNXUZXE4P", grade="excelente", **kw):
+    """An offer we could attribute to the ASIN this poll."""
+    return _obs(price, listing_id=f"{ASIN}:{seller}:{grade}", **kw)
+
+
+def test_unseen_fires_below_every_attributed_offer(conn):
+    (a,) = triggers.unseen_offers(conn, [_line(3700.0, 13.22)],
+                                  [_named(4275.78), _named(4149.0, grade="aceitavel")], NOW)
+    assert (a.trigger, a.priority, a.level) == ("unseen_offer", "🔍", "aggressive")
+    assert a.metric == 3713.22                      # card + shipping
+    assert (a.attributed, a.attributed_min) == (2, 4149.0)
+    assert a.key == f"unseen:{ASIN}"
+
+
+def test_unseen_needs_the_2026_low_and_counts_shipping(conn):
+    assert triggers.unseen_offers(conn, [_line(3919.0)], [], NOW)[0].level == "year_low"
+    assert triggers.unseen_offers(conn, [_line(3910.0, 13.22)], [], NOW) == []  # 3923.22
+    assert triggers.unseen_offers(conn, [_line(4582.47, 13.22)], [], NOW) == []
+    assert triggers.unseen_offers(conn, [_line(None)], [], NOW) == []          # no price
+    assert triggers.unseen_offers(conn, [_line(3500.0)], [], NOW)[0].level == "instant_buy"
+
+
+def test_unseen_is_quiet_when_the_minimum_is_an_offer_we_see(conn):
+    # 2026-10-22: "3 ofertas a partir de R$4.582,47" was the buybox itself
+    assert triggers.unseen_offers(conn, [_line(3850.0, 13.22)], [_named(3850.0)], NOW) == []
+    assert triggers.unseen_offers(conn, [_line(3850.0)], [_named(3850.0)], NOW) == []
+    # a card price rebuilt from the plan sits cents above Amazon's: same offer
+    assert triggers.unseen_offers(conn, [_line(3850.0)], [_named(3850.33)], NOW) == []
+    # a known Bom or sold-out offer at the minimum is known too (no 🔍 for it)
+    assert triggers.unseen_offers(conn, [_line(3700.0)],
+                                  [_named(3700.0, grade="bom", grade_rank=2)], NOW) == []
+    assert triggers.unseen_offers(conn, [_line(3700.0)],
+                                  [_named(3700.0, in_stock=False)], NOW) == []
+    # other ASINs' offers don't count as attributed here
+    other = _obs(3600.0, listing_id="B0FTMQQ7L2:X:excelente")
+    assert len(triggers.unseen_offers(conn, [_line(3700.0)], [other], NOW)) == 1
+
+
+def test_unseen_fires_with_nothing_attributed(conn):
+    (a,) = triggers.unseen_offers(conn, [_line(3800.0)], [], NOW)   # no buybox, panel 503
+    assert (a.level, a.attributed, a.attributed_min) == ("aggressive", 0, None)
+
+
+def _unseen_send(conn, price, ts, shipping=None, attributed=(), n=4):
+    alerts = triggers.unseen_offers(conn, [_line(price, shipping, n=n, ts=ts)],
+                                    list(attributed), ts)
+    store.insert_offer_summary(conn, _line(price, shipping, n=n, ts=ts))
+    for a in alerts:
+        store.record_alert(conn, a.key, a.trigger, a.metric, ts)
+    return [a.level for a in alerts]
+
+
+def _no_line(ts, price=4582.47, asin=ASIN):
+    """The marker a product page without the other-offers line leaves."""
+    return OfferSummary(asin=asin, offers_total=1, min_card_price=price,
+                        scope=OfferSummary.NO_LINE, ts=ts, storage_gb=512, color="preto")
+
+
+def test_unseen_ladder_per_asin(conn):
+    t = lambda m: f"2026-08-22T12:{m:02d}:00+00:00"   # noqa: E731
+    assert _unseen_send(conn, 3850.0, t(0)) == ["year_low"]
+    assert _unseen_send(conn, 3850.0, t(4)) == []                   # same price
+    assert _unseen_send(conn, 3900.0, t(8)) == []                   # a rise never alerts
+    assert _unseen_send(conn, 3810.0, t(12)) == []                  # -40 only
+    assert _unseen_send(conn, 3795.0, t(16)) == ["aggressive"]      # stronger level
+    assert _unseen_send(conn, 3760.0, t(20)) == []                  # -35
+    assert _unseen_send(conn, 3745.0, t(24)) == ["aggressive"]      # -50 vs 3.795
+    assert _unseen_send(conn, 3880.0, t(28)) == []                  # rise to 🟡
+    # another ASIN has its own ladder
+    (a,) = triggers.unseen_offers(conn, [_line(3850.0, asin="B0FTMQQ7L2", ts=t(32))], [], t(32))
+    assert a.key == "unseen:B0FTMQQ7L2"
+
+
+def test_unseen_ladder_restarts_once_the_hidden_offer_is_gone(conn):
+    t = lambda m: f"2026-08-22T12:{m:02d}:00+00:00"   # noqa: E731
+    assert _unseen_send(conn, 3850.0, t(0)) == ["year_low"]
+    assert _unseen_send(conn, 4582.47, t(4), shipping=13.22, n=3) == []   # seller left
+    assert _unseen_send(conn, 3850.0, t(8)) == ["year_low"]         # a new one: news
+    assert _unseen_send(conn, 3850.0, t(12)) == []
+
+
+def test_unseen_price_bouncing_across_the_ceiling_alerts_once(conn):
+    # one hidden offer repriced back and forth: every change is stored, and a
+    # line above R$ 3.919 used to reset the ladder each time
+    t = lambda m: f"2026-08-22T12:{m:02d}:00+00:00"   # noqa: E731
+    sent = [_unseen_send(conn, p, t(4 * i), shipping=0.0)
+            for i, p in enumerate((3915.0, 3925.0, 3915.0, 3925.0, 3915.0))]
+    assert sent == [["year_low"], [], [], [], []]
+    # shipping pushing the same offer over the ceiling is no departure either
+    assert _unseen_send(conn, 3910.0, t(20), shipping=13.22) == []      # 3923.22
+    assert _unseen_send(conn, 3915.0, t(24), shipping=0.0) == []
+
+
+def test_unseen_ladder_restarts_when_the_line_disappears(conn):
+    # S1-S5: the hidden offer sold, the page showed only the buybox (no line),
+    # then a different seller listed just R$ 10 lower — that is news
+    t = lambda m: f"2026-08-22T12:{m:02d}:00+00:00"   # noqa: E731
+    assert _unseen_send(conn, 4149.0, t(0), n=2) == []
+    assert _unseen_send(conn, 3890.0, t(4), n=2) == ["year_low"]
+    for m in (8, 12):
+        marker = _no_line(t(m))
+        assert triggers.unseen_offers(conn, [marker], [], t(m)) == []   # never fires
+        store.insert_offer_summary(conn, marker)
+    assert _unseen_send(conn, 3880.0, t(16), n=2) == ["year_low"]
+    assert _unseen_send(conn, 3880.0, t(20), n=2) == []
+
+
+def test_unseen_same_price_after_the_line_disappeared_alerts_again(conn):
+    t = lambda m: f"2026-08-22T12:{m:02d}:00+00:00"   # noqa: E731
+    assert _unseen_send(conn, 3700.0, t(0)) == ["aggressive"]
+    store.insert_offer_summary(conn, _no_line(t(4)))
+    assert _unseen_send(conn, 3700.0, t(8), n=2) == ["aggressive"]   # it came back
+
+
+def _t(m):
+    return f"2026-08-22T{12 + m // 60:02d}:{m % 60:02d}:00+00:00"
+
+
+def test_unseen_counts_a_recently_stored_offer_as_known(conn):
+    # Q1: the panel named an Aceitável unit at 3.890; Q2, four minutes later,
+    # the panel 503s and only the buybox is named — the line is unchanged
+    store.insert_observation(conn, _named(3890.0, seller="ASSURANT", grade="aceitavel",
+                                          grade_rank=1, ts=_t(0)))
+    buybox = _named(4275.78, ts=_t(4))
+    assert triggers.unseen_offers(conn, [_line(3890.0, ts=_t(4))], [buybox], _t(4)) == []
+    # stored too long ago: no longer proof of anything
+    (a,) = triggers.unseen_offers(conn, [_line(3890.0, ts=_t(125))], [buybox], _t(125))
+    assert (a.metric, a.attributed, a.attributed_min) == (3890.0, 1, 4275.78)
+    # stored as sold out since: it can't be the offer behind the line
+    store.insert_observation(conn, _named(3890.0, seller="ASSURANT", grade="aceitavel",
+                                          grade_rank=1, in_stock=False, ts=_t(8)))
+    (a,) = triggers.unseen_offers(conn, [_line(3890.0, ts=_t(12))], [buybox], _t(12))
+    assert a.metric == 3890.0
+
+
+def test_unseen_counts_an_offer_rotated_out_of_the_buybox_as_known(conn):
+    store.insert_observation(conn, _named(3900.0, seller="ASSURANT", ts=_t(0)))
+    cell = _named(4582.47, seller="CELL", ts=_t(4))
+    assert triggers.unseen_offers(conn, [_line(3900.0, ts=_t(4))], [cell], _t(4)) == []
+    # a cheaper one behind it is still hidden: the known 3.900 doesn't mask it
+    (a,) = triggers.unseen_offers(conn, [_line(3840.0, ts=_t(8))], [cell], _t(8))
+    assert (a.level, a.attributed, a.attributed_min) == ("year_low", 2, 3900.0)
+
+
+def test_unseen_ladder_only_counts_delivered_alerts(conn):
+    alerts = triggers.unseen_offers(conn, [_line(3850.0)], [], NOW)
+    assert alerts                                    # nothing recorded (outage) ...
+    assert triggers.unseen_offers(conn, [_line(3850.0)], [], NOW)   # ... so it retries
+
+
+def test_threshold_level():
+    assert [triggers.threshold_level(v) for v in (3500.0, 3500.01, 3800.0, 3919.0,
+                                                  3919.01, None)] == [
+        "instant_buy", "aggressive", "aggressive", "year_low", None, None]

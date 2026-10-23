@@ -11,6 +11,10 @@ displays on the offer, or a code validated in a logged-in cart, named by
 ``coupon_code``). The two never stack at checkout; ``normalize`` applies that
 rule, so the raw values stay available for the 12x total (which only the
 coupon lowers).
+
+``OfferSummary`` is the product page's "other offers" line (count + lowest
+price, no seller), or the marker that a page showed none, stored in
+``offer_summary``.
 """
 from __future__ import annotations
 
@@ -75,6 +79,62 @@ class Observation:
         known = {f.name for f in fields(cls)}
         data = {k: row[k] for k in row.keys() if k in known}
         return cls(**data)
+
+
+@dataclass
+class OfferSummary:
+    """Amazon's "Comparar outras N ofertas a partir de R$ X (+R$ Y de envio)"
+    line on a product page (``#aod-ingress-link``), one per ASIN per poll.
+
+    Why it exists: from GitHub Actions IPs the All Offers panel always answers
+    HTTP 503, so the server can name only the buybox seller. This line still
+    loads with the product page and says how many offers the ASIN has
+    (``offers_total`` counts *all* of them, the buybox included) and the
+    lowest *card* price among them — enough to notice a cheaper offer whose
+    seller and condition we can't see. It is deliberately not an Observation:
+    with no seller or grade it can't be a listing, so it never enters the
+    price thresholds; it feeds the 🔍 alert (``triggers.unseen_offers``), the
+    ``offer_summary`` table and the heartbeat instead.
+
+    A product page that loads fine *without* the line (a listing whose only
+    offer is the buybox shows none) is recorded too, as a marker with scope
+    ``NO_LINE``: 1 offer at the buybox's card price (0 offers when the buybox
+    is unavailable). Without it, a line that vanished would read as still
+    there — stale counts in the heartbeat, and a 🔍 ladder that never learns
+    the hidden offer left (``store.last_offer_departure``).
+    """
+    asin: str
+    offers_total: int
+    min_card_price: float | None = None   # None: the line showed no price
+    min_shipping: float | None = None     # "+R$ 13,22 de envio"; 0.0 for GRÁTIS; None: not shown
+    # "ALL" | "NEW" | "USED" (the link's condition=), None when the link names
+    # none, NO_LINE for the no-line marker.
+    scope: str | None = None
+    ts: str | None = None                 # set by the orchestrator
+
+    # --- transient (from the page title; for alert/heartbeat text) ---
+    storage_gb: int | None = None
+    color: str | None = None
+    source_id: str | None = None
+
+    PERSISTED = ("ts", "asin", "offers_total", "min_card_price", "min_shipping", "scope")
+    NO_LINE = "NONE"
+
+    @property
+    def no_line(self) -> bool:
+        """Is this the no-line marker (the page showed no other offers)?"""
+        return self.scope == self.NO_LINE
+
+    @property
+    def min_total(self) -> float | None:
+        """The cheapest offer as the user would pay it: card price + its
+        shipping (none shown counts as free)."""
+        if self.min_card_price is None:
+            return None
+        return round(self.min_card_price + (self.min_shipping or 0.0), 2)
+
+    def as_row(self) -> dict:
+        return {name: getattr(self, name) for name in self.PERSISTED}
 
 
 @dataclass

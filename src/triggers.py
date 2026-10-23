@@ -18,13 +18,23 @@ came back starts fresh (single-unit refurb offers come and go).
 The multi-store triggers (new_low, grade_upgrade, venue_spread,
 trocafy_review) never apply to Amazon offers: in Amazon-only mode they would
 fire on months of other stores' history and on grade-2 offers.
+
+🔍 ``unseen_offers`` works on the product page's "N ofertas a partir de R$ X"
+line instead of on observations: while Amazon 503s the offers panel from CI,
+a cheap seller other than the buybox is only visible there, nameless and
+ungraded. It gets its own alert (and its own per-ASIN ladder) rather than a
+threshold alert, because nothing says the offer is Excelente — the user has to
+look. An offer we already know — seen this poll, or stored in stock within
+UNSEEN_KNOWN_HOURS (the panel works on and off in CI, and the buybox rotates)
+— never passes for a hidden one.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from . import store
-from .models import Observation
+from .models import Observation, OfferSummary
 from .normalize import card_total
 
 # 12x card-total thresholds (R$), set by the user Oct 2026.
@@ -53,7 +63,19 @@ PRIORITY = {
     "venue_spread": "🟢",
     "grade_upgrade": "🟢",
     "trocafy_review": "🟢",
+    "unseen_offer": "🔍",
 }
+
+# 🔍: an offers-line price must undercut every attributed offer by more than
+# this. A card price rebuilt from the 12x plan can sit cents above Amazon's own
+# (12 x R$ 381,90 = 4.582,80 for a 4.582,47 offer); the same offer must not
+# read as a hidden one.
+UNSEEN_MARGIN = 1.0
+# 🔍: an offer stored in stock this recently still counts as known when this
+# poll couldn't see it (offers panel blocked, buybox moved to another seller).
+# Every listing seen is stored at least hourly, so two hours covers a missed
+# panel or two; an offer gone longer must not hide a new one behind the line.
+UNSEEN_KNOWN_HOURS = 2
 
 
 @dataclass
@@ -89,20 +111,26 @@ def eligible(o: Observation) -> bool:
     return bool(o.in_stock) and (o.grade_rank or 0) >= ALERT_MIN_RANK
 
 
-def _threshold_alert(o: Observation) -> Alert | None:
-    """Fire only the strongest matching 12x threshold (they overlap by
+def threshold_level(total: float | None) -> str | None:
+    """The strongest 12x threshold a total reaches (they overlap by
     construction: anything under BUY_NOW_12X is also under GOOD_12X and
-    YEAR_LOW_12X)."""
-    total = card_total(o)
+    YEAR_LOW_12X), or None above all of them."""
     if total is None:
         return None
     if total <= BUY_NOW_12X:
-        return Alert("instant_buy", PRIORITY["instant_buy"], o, metric=total)
+        return "instant_buy"
     if total <= GOOD_12X:
-        return Alert("aggressive", PRIORITY["aggressive"], o, metric=total)
+        return "aggressive"
     if total <= YEAR_LOW_12X:
-        return Alert("year_low", PRIORITY["year_low"], o, metric=total)
+        return "year_low"
     return None
+
+
+def _threshold_alert(o: Observation) -> Alert | None:
+    """Fire only the strongest matching 12x threshold."""
+    total = card_total(o)
+    level = threshold_level(total)
+    return Alert(level, PRIORITY[level], o, metric=total) if level else None
 
 
 def evaluate(conn, observations: list[Observation], now: str,
@@ -236,3 +264,80 @@ def _dedup(conn, candidates: list[Alert], now: str) -> list[Alert]:
                 continue  # not a big enough drop -> suppress repeat
         kept.append(a)
     return kept
+
+
+# --- 🔍 unseen offer: the dp's offers line undercuts everything we can name ---
+
+@dataclass
+class UnseenOfferAlert:
+    """The product page says an offer exists at ``metric`` (card + shipping,
+    from the "a partir de" line) below every offer we know for the ASIN
+    (this poll's, plus recently stored ones) — a seller/condition the server
+    can't see while Amazon 503s the offers panel. ``level`` is the 12x
+    threshold it reaches."""
+    summary: OfferSummary
+    level: str                       # instant_buy | aggressive | year_low
+    metric: float                    # what the ladder compares and records
+    attributed: int = 0              # offers we know for the ASIN
+    attributed_min: float | None = None   # their lowest card price
+    trigger: str = "unseen_offer"
+    priority: str = PRIORITY["unseen_offer"]
+
+    @property
+    def key(self) -> str:
+        """alerts_sent.listing_id: one ladder per ASIN."""
+        return f"unseen:{self.summary.asin}"
+
+
+def unseen_offers(conn, summaries: list[OfferSummary], observations: list[Observation],
+                  now: str) -> list[UnseenOfferAlert]:
+    """🔍 alerts to send this cycle (post-dedup). Fires when an offers line's
+    cheapest offer (``min_total``) is within YEAR_LOW_12X and more than
+    UNSEEN_MARGIN below every offer known for that ASIN — at any grade or
+    stock state, so the buybox (already judged by the thresholds) or a known
+    Aceitável offer never re-alert as "unseen". Known means attributed this
+    poll, or stored in stock within UNSEEN_KNOWN_HOURS (``store.recent_offers``):
+    the panel loads on and off in CI and the buybox rotates between sellers,
+    so an offer named four minutes ago is no secret when this poll can't name
+    it. With nothing known (no buybox, panel blocked) any qualifying price
+    fires. A no-line marker never does: it says the buybox is all there is."""
+    out: list[UnseenOfferAlert] = []
+    seen: set[str] = set()
+    since = (datetime.fromisoformat(now) - timedelta(hours=UNSEEN_KNOWN_HOURS)).isoformat()
+    for s in summaries:
+        total = s.min_total
+        level = threshold_level(total)
+        if s.no_line or level is None or s.asin in seen:
+            continue
+        seen.add(s.asin)
+        known = {o.listing_id: o.list_price for o in observations
+                 if o.venue == "amazon" and o.list_price is not None
+                 and o.listing_id.split(":", 1)[0] == s.asin}
+        for r in store.recent_offers(conn, s.asin, since, now):
+            known.setdefault(r["listing_id"], r["list_price"])   # this poll's price wins
+        low = min(known.values(), default=None)
+        if low is not None and total >= low - UNSEEN_MARGIN:
+            continue   # the line's minimum is an offer we already know
+        a = UnseenOfferAlert(s, level, total, len(known), low)
+        if not _unseen_repeat(conn, a, now):
+            out.append(a)
+    return out
+
+
+def _unseen_repeat(conn, a: UnseenOfferAlert, now: str) -> bool:
+    """The threshold ladder (``_threshold_repeat``) per ASIN: compared with the
+    🔍 alerts sent since a reading last showed an offer leave (the page lost
+    its line, or the count fell with nothing left within YEAR_LOW_12X —
+    ``store.last_offer_departure``, the analogue of a sell-out), it passes
+    only DEDUP_DELTA_12X below the lowest of them or at a stronger level; a
+    rise never alerts, and neither does a price bouncing across the ceiling."""
+    since = store.last_offer_departure(conn, a.summary.asin, YEAR_LOW_12X, now)
+    priors = store.threshold_alerts(conn, a.key, (a.trigger,), since, now)
+    if not priors:
+        return False
+    values = [v for _, v in priors if v is not None]
+    if not values:
+        return True   # can't confirm a drop -> suppress
+    if _STRENGTH[a.level] > max(_STRENGTH.get(threshold_level(v), 0) for v in values):
+        return False
+    return a.metric > min(values) - DEDUP_DELTA_12X
