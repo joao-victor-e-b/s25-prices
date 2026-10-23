@@ -1,0 +1,20 @@
+name: diag-aod
+
+# Temporary: which request shape gets Amazon's All Offers panel from a CI IP.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - run: python scripts/diag_aod.py
