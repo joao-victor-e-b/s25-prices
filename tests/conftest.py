@@ -4,6 +4,10 @@ src/coupon_checks.yaml is edited by hand (and by Claude in Chrome) while the
 suite may run, so no test reads the real file implicitly: by default every
 test sees a missing checks file. Tests that need checks write their own (see
 ``write_checks``).
+
+The Amazon scraper keeps process-wide state (request pacer, shared session,
+per-source poll counters, dp cache): every test starts from a fresh copy with
+the pacer's waits turned off (tests that check pacing build their own Pacer).
 """
 from pathlib import Path
 
@@ -11,11 +15,20 @@ import pytest
 import yaml
 
 from src import coupon_checks
+from src.sources import amazon
 
 
 @pytest.fixture(autouse=True)
 def _isolated_checks(tmp_path, monkeypatch):
     monkeypatch.setattr(coupon_checks, "CHECKS_PATH", tmp_path / "coupon_checks.yaml")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_amazon_state(monkeypatch):
+    amazon.reset_state()
+    monkeypatch.setattr(amazon, "PACER", amazon.Pacer(gap=0, sleep=lambda s: None))
+    yield
+    amazon.reset_state()
 
 
 @pytest.fixture

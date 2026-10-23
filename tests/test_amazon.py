@@ -867,3 +867,161 @@ def test_bank_wallet_and_multi_unit_coupons_are_conditional():   # A1
                  "Cupom de R$ 100 para membros Prime",
                  "Compre 1 e economize R$ 50 com cupom"):
         assert not is_conditional_promo(text), text
+
+
+# --- CI rate limiting: pacing, AOD-first, retry (Oct 2026) ----------------------
+
+from src.sources import amazon as amazon_mod   # noqa: E402
+
+
+def test_pacer_spaces_every_request_and_honours_a_deferred_wait():
+    t = {"now": 0.0}
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(round(s, 2))
+        t["now"] += s
+
+    pacer = amazon_mod.Pacer(gap=10, jitter=0.3, clock=lambda: t["now"], sleep=sleep,
+                             uniform=lambda a, b: 1.0)
+    pacer.wait()                       # first request: no wait
+    t["now"] += 3
+    pacer.wait()                       # 3 s later: waits the other 7
+    pacer.defer(45)
+    pacer.wait()                       # the AOD retry: >= 45 s after the last
+    pacer.wait()                       # back to the normal gap
+    assert sleeps == [7.0, 45.0, 10.0] and pacer.count == 4
+    jittery = amazon_mod.Pacer(gap=10, jitter=0.3, clock=lambda: 0.0, sleep=sleeps.append,
+                               uniform=lambda a, b: b)
+    jittery.wait()
+    jittery.wait()
+    assert sleeps[-1] == 13.0          # 10 s + 30%
+
+
+def _routed_session(monkeypatch, routes, calls, warm=True):
+    session = amazon_mod.amazon_session()
+    if warm:
+        session.cookies.set("session-id", "1", domain=".amazon.com.br")
+
+    def get(url, headers=None, timeout=None):
+        calls.append(url)
+        for needle, resp in routes:
+            if needle in url:
+                return resp() if callable(resp) else resp
+        raise AssertionError(f"unexpected URL {url}")
+    monkeypatch.setattr(session, "get", get)
+    return session
+
+
+def _kinds(calls):
+    return ["aod" if "aodAjaxMain" in u else "dp" for u in calls]
+
+
+def test_aod_first_dp_every_4th_poll_and_plan_cached(monkeypatch):
+    calls = []
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
+    kinds = []
+    for _ in range(5):
+        calls.clear()
+        obs = _src().fetch()           # a new source object each poll, like run.poll
+        kinds.append(_kinds(calls))
+        cs = next(o for o in obs if o.listing_id == f"{ASIN}:{CELLULAR}:excelente")
+        assert (cs.installments_n, cs.installment_value) == (12, 381.90)   # cached plan
+        assert len(obs) == 3                                               # dp never stored
+    assert kinds == [["dp", "aod"], ["aod"], ["aod"], ["aod"], ["dp", "aod"]]
+    assert amazon_mod.PACER.count == 7                                     # all paced
+
+
+def test_cached_plan_only_lends_itself_at_an_unchanged_price(monkeypatch):
+    calls = []
+    aod = {"body": AOD.read_bytes()}
+    _routed_session(monkeypatch, [("aodAjaxMain", lambda: _Resp(200, aod["body"])),
+                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
+    _src().fetch()
+    aod["body"] = AOD.read_bytes().replace(b"4.582,47", b"4.499,00")
+    assert aod["body"] != AOD.read_bytes()
+    obs = _src().fetch()               # buybox price moved: the old plan is stale
+    cs = next(o for o in obs if o.listing_id == f"{ASIN}:{CELLULAR}:excelente")
+    assert cs.list_price == 4499.0 and cs.installments_n is None
+
+
+def test_dp_every_poll_while_it_shows_a_coupon(monkeypatch):
+    calls = []
+    dp = re.sub(rb'(<div id="couponsInBuybox_feature_div"[^>]*>)',
+                rb"\1Economize R$ 100,00 com cupom", DP_PIX.read_bytes(), count=1)
+    assert dp != DP_PIX.read_bytes()
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+                                  (f"/dp/{ASIN}", _Resp(200, dp))], calls)
+    for _ in range(3):
+        calls.clear()
+        _src().fetch()
+        assert _kinds(calls) == ["dp", "aod"]      # the coupon moves the 12x total
+
+
+def test_cold_session_fetches_the_dp_first(monkeypatch):
+    calls = []
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))],
+                    calls, warm=False)
+    amazon_mod._FETCHES["amazon_seminovos"] = 1     # not a dp_every turn
+    _src().fetch()
+    assert _kinds(calls) == ["dp", "aod"]
+
+
+def test_blocked_aod_is_retried_once_after_a_long_wait(monkeypatch):
+    calls, sleeps = [], []
+    monkeypatch.setattr(amazon_mod, "PACER", amazon_mod.Pacer(
+        gap=0, clock=lambda: 0.0, sleep=sleeps.append))
+    answers = [_Resp(503, AOD_ERROR_BODY), _Resp(200, AOD.read_bytes())]
+    _routed_session(monkeypatch, [("aodAjaxMain", lambda: answers.pop(0)),
+                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
+    amazon_mod._FETCHES["amazon_seminovos"] = 1
+    src = _src()
+    obs = src.fetch()
+    assert _kinds(calls) == ["aod", "aod"] and sleeps == [amazon_mod.AOD_RETRY_WAIT_S]
+    assert len(obs) == 3 and src.block_level is None and src.aod_ok == 1
+
+
+def test_aod_blocked_twice_falls_back_to_the_dp_as_soft_trouble(monkeypatch):
+    calls = []
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(503, AOD_ERROR_BODY)),
+                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
+    amazon_mod._FETCHES["amazon_seminovos"] = 1
+    src = _src()
+    (o,) = src.fetch()
+    assert _kinds(calls) == ["aod", "aod", "dp"]
+    assert o.listing_id == f"{ASIN}:{CELLULAR}:excelente" and o.installments_n == 12
+    assert (src.block_level, src.blocked, src.aod_ok, src.aod_tried) == ("soft", True, 0, 1)
+
+
+def test_empty_listing_is_not_retried_and_not_trouble(monkeypatch):
+    calls = []
+    empty = b"<html><body><div id='aod-container'></div></body></html>"
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, empty)),
+                                  (f"/dp/{ASIN}", _Resp(200, DP_PIX.read_bytes()))], calls)
+    amazon_mod._FETCHES["amazon_seminovos"] = 1
+    src = _src()
+    src.fetch()
+    assert _kinds(calls) == ["aod", "dp"] and src.block_level is None
+
+
+def test_dp_captcha_is_hard_trouble(monkeypatch):
+    calls = []
+    _routed_session(monkeypatch, [("aodAjaxMain", _Resp(200, AOD.read_bytes())),
+                                  (f"/dp/{ASIN}", _Resp(200, CAPTCHA_BODY))], calls)
+    src = _src()
+    assert len(src.fetch()) == 3 and src.block_level == "hard"
+
+
+def test_promo_terms_go_through_the_pacer(monkeypatch):
+    from src.sources.amazon import promo_terms
+
+    class S:
+        def get(self, url, headers=None, timeout=None):
+            r = _Resp(200, b'{"tncSectionContentMap": {"TNC_CONTENT": "At\\u00e9 R$ 50"}}')
+            r.json = lambda: {"tncSectionContentMap": {"TNC_CONTENT": "Até R$ 50"}}
+            return r
+    before = amazon_mod.PACER.count
+    assert promo_terms(S(), "A3N43RG5YNRVDU") == "Até R$ 50"
+    assert amazon_mod.PACER.count == before + 1

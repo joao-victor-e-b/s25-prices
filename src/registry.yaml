@@ -11,6 +11,8 @@
 #   module  scraper module name (null until implemented)
 #   enabled false = skipped by poll and heartbeat (config kept for later)
 #   every   N = poll on every Nth loop iteration only (default 1)
+#   dp_every N = Amazon product page on every Nth poll of the source (default 4;
+#           the offers panel, fetched every poll, carries the card prices)
 #   default_grade  condition for a buybox that names none (new units: Novo)
 #
 # Amazon-only mode (Oct 2026): the user buys on amazon.com.br in 12x, so every
@@ -147,13 +149,13 @@ sources:
   # R$ 3.543 with coupon SMART900 on 2026-10-08, and Amazon Quase Novo puts
   # "Usado - Como novo" units on the new listing). AOD headings: "Novo" ->
   # rank 5, "Usado - Como novo" -> 4; the dp names no condition, hence
-  # default_grade. `every: 2` polls them on every 2nd loop iteration so one
-  # poll stays at <= 6 ASINs x 2 requests.
+  # default_grade. `every: 3` polls them on every 3rd loop iteration (Amazon
+  # rate-limits bursts from CI IPs; requests are paced ~10 s apart anyway).
   - id: amazon_novo_256_preto
     seller: Amazon
     venue: amazon
     tier: 1
-    every: 2
+    every: 3
     url: https://www.amazon.com.br/dp/B0DSYJCY45
     asin: B0DSYJCY45
     module: amazon
@@ -167,7 +169,7 @@ sources:
     seller: Amazon
     venue: amazon
     tier: 1
-    every: 2
+    every: 3
     url: https://www.amazon.com.br/dp/B0F1HDQSQG
     asin: B0F1HDQSQG
     module: amazon
@@ -181,7 +183,7 @@ sources:
     seller: Amazon
     venue: amazon
     tier: 1
-    every: 2
+    every: 3
     url: https://www.amazon.com.br/dp/B0DSXZ4FZT
     asin: B0DSXZ4FZT
     module: amazon
@@ -195,7 +197,7 @@ sources:
     seller: Amazon
     venue: amazon
     tier: 1
-    every: 2
+    every: 3
     url: https://www.amazon.com.br/dp/B0DTMCLTKV
     asin: B0DTMCLTKV
     module: amazon

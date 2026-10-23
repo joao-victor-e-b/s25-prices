@@ -11,18 +11,30 @@ succeeds. Blocks are detected (captcha markers, missing #productTitle, error
 pages) and *raise*, so the run counts a fetch failure in the heartbeat rather
 than silently reporting "no deal" (spec §7 decay warning).
 
-Two requests per poll, on one session:
+Two pages per ASIN, on one shared session:
 
-1. ``/dp/{asin}`` — the product page. Only shows the *buybox* offer, but it is
-   the only place with the installment plan ("12x de R$ 381,90 sem juros").
-2. ``aodAjaxMain`` — the "Comparar outras ofertas" (All Offers Display) panel:
-   every seller's offer for the ASIN. Without it a cheaper non-buybox seller is
+1. ``aodAjaxMain`` — the "Comparar outras ofertas" (All Offers Display) panel:
+   every seller's offer for the ASIN, with each card price on its add-to-cart
+   label — all the 12x total needs. Without it a cheaper non-buybox seller is
    invisible (Assurant Ecophone at R$3.919 was missed whenever CellularStore
-   held the buybox). The AOD's pinned offer *is* the buybox, so the dp plan is
-   copied onto it; other AOD offers get no plan (we don't invent one).
+   held the buybox). Fetched every poll, first.
+2. ``/dp/{asin}`` — the product page. Only shows the *buybox* offer, but it is
+   the only place with the installment plan ("12x de R$ 381,90 sem juros"),
+   the clip-coupon widget and the buybox promos. Fetched only when due: the
+   session has no Amazon cookies yet (a cold session's XHR gets 503s), every
+   ``dp_every``-th poll of the source (DP_EVERY), every poll while the last dp
+   showed a coupon (it moves the 12x total), and as the fallback when the AOD
+   failed. In between, the last dp's plan/promos are merged onto the AOD's
+   pinned offer (the buybox) while its card price is unchanged.
 
-If the AOD is blocked we degrade to the dp buybox alone (yesterday's coverage,
-not zero); only when both fail does fetch() raise.
+Amazon rate-limits bursts from datacenter IPs (CI got HTTP 503 on most AODs
+at 6 ASINs x 2 requests a minute), so every Amazon request in the process goes
+through one ``PACER`` (AMAZON_MIN_GAP_S ± 30% apart, all sources and the
+promotion-terms lookup together), and a blocked AOD is retried once after
+AOD_RETRY_WAIT_S before falling back to the dp buybox (yesterday's coverage,
+not zero); only when both fail does fetch() raise. ``block_level`` tells the
+loop how hard to back off: "soft" (AOD blocked, dp fine) or "hard" (the dp
+itself blocked / captcha).
 
 Price semantics (same as the other sources, so normalize.pv() works):
 ``list_price`` is the *card* price — what the sem-juros plan totals — and
@@ -75,7 +87,7 @@ from bs4 import BeautifulSoup
 
 from ..models import Observation
 from ..normalize import coupon_from_text
-from .base import Source
+from .base import Source, http_session
 
 _HOST = "https://www.amazon.com.br"
 _AOD_URL = (_HOST + "/gp/product/ajax/aodAjaxMain/ref=dp_aod_ALL_mbc"
@@ -135,6 +147,76 @@ _CAPTCHA_MARKERS = (
 )
 
 _DEFAULT_MATCH = {"storage_gb": 256, "colors": ["preto", "jetblack"]}
+
+AMAZON_MIN_GAP_S = 10.0   # between any two Amazon requests in the process
+GAP_JITTER = 0.3          # ± share of the gap
+AOD_RETRY_WAIT_S = 45.0   # before retrying a blocked AOD once
+DP_EVERY = 4              # product page on every Nth poll of a source (registry: dp_every)
+
+
+class Pacer:
+    """Process-wide spacing between Amazon requests: each waits until
+    ``gap`` (± jitter) has passed since the previous one, or a longer
+    ``defer``-red wait (the AOD retry). ``count`` is requests made, for the
+    per-poll log. Tests zero ``gap``."""
+
+    def __init__(self, gap: float = AMAZON_MIN_GAP_S, jitter: float = GAP_JITTER,
+                 clock=time.monotonic, sleep=time.sleep, uniform=random.uniform):
+        self.gap, self.jitter = gap, jitter
+        self.clock, self.sleep, self.uniform = clock, sleep, uniform
+        self.last: float | None = None
+        self.count = 0
+        self._extra = 0.0
+
+    def defer(self, seconds: float) -> None:
+        """Make the next request wait at least ``seconds`` after the last one."""
+        self._extra = max(self._extra, seconds)
+
+    def wait(self) -> None:
+        if self.last is not None:
+            want = self.gap * self.uniform(1 - self.jitter, 1 + self.jitter) if self.gap > 0 else 0.0
+            want = max(want, self._extra)
+            left = want - (self.clock() - self.last)
+            if left > 0:
+                self.sleep(left)
+        self._extra = 0.0
+        self.last = self.clock()
+        self.count += 1
+
+
+PACER = Pacer()
+_SESSION = None                       # shared by every Amazon source (cookies persist)
+_FETCHES: dict[str, int] = {}         # source_id -> polls so far (dp_every counting)
+_DP_CACHE: dict[str, Observation] = {}  # source_id -> last good dp buybox
+
+
+def amazon_session():
+    """The process-wide Amazon session (cookies survive across polls)."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = http_session()
+    return _SESSION
+
+
+def amazon_get(session, url: str, **kwargs):
+    """GET through the shared pacer."""
+    PACER.wait()
+    return session.get(url, **kwargs)
+
+
+def reset_state() -> None:
+    """Forget the shared session, per-source counters and dp cache (tests)."""
+    global _SESSION
+    _SESSION = None
+    _FETCHES.clear()
+    _DP_CACHE.clear()
+
+
+def _has_amazon_cookies(session) -> bool:
+    try:
+        return any("amazon" in (c.domain or "") for c in session.cookies)
+    except (AttributeError, TypeError):
+        return False
 
 _BROWSER_HEADERS = {
     "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -384,9 +466,9 @@ def promo_terms(session, promo_id: str, max_chars: int = 240) -> str | None:
     compra ... Cartão Amazon" conditions a promo line doesn't show. Best-effort:
     None on any failure."""
     try:
-        r = session.get(f"{_HOST}/promotion/tnc/{promo_id}",
-                        headers={**_aod_headers(""), "Referer": _HOST + "/"},
-                        timeout=20)
+        r = amazon_get(session, f"{_HOST}/promotion/tnc/{promo_id}",
+                       headers={**_aod_headers(""), "Referer": _HOST + "/"},
+                       timeout=20)
         if r.status_code != 200:
             return None
         content = (r.json().get("tncSectionContentMap") or {}).get("TNC_CONTENT") or ""
@@ -510,11 +592,11 @@ class AodPage:
 class AmazonSeminovosSource(Source):
     seller = "Amazon Seminovos"
     venue = "amazon"
-    # Politeness pause between requests (seconds, uniform). Tests zero it.
-    pause_range: tuple[float, float] = (1.0, 2.5)
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
+        self.session = amazon_session()
+        self.dp_every = max(int(cfg.get("dp_every", DP_EVERY) or DP_EVERY), 1)
         self.match = {**_DEFAULT_MATCH, **(cfg.get("match") or {})}
         self.asin = cfg.get("asin")
         self.product_url = cfg.get("url") or f"{_HOST}/dp/{self.asin}"
@@ -526,7 +608,9 @@ class AmazonSeminovosSource(Source):
         self.complete = False
         self.degraded: list[str] = []
         self.blocked = False
+        self.block_level: str | None = None   # "soft" | "hard" | None
         self.notes: list[str] = []   # parse-level problems (missing card price)
+        self.aod_tried = self.aod_ok = 0   # this fetch, for the per-poll log
 
     # --- orchestration ----------------------------------------------------
 
@@ -541,30 +625,50 @@ class AmazonSeminovosSource(Source):
         self.complete = False
         self.degraded = []
         self.blocked = False
+        self.block_level = None
         self.notes = []
-        dp_ok = False
+        self.aod_tried = self.aod_ok = 0
+        state = {"tried": False, "ok": False}
 
-        try:
-            dp, asin = self._fetch_dp(asin)
-            dp_ok = True
-        except Exception as e:  # captcha, HTTP error, no title: Amazon resisting
-            errors.append(f"dp: {e}")
-            self.blocked = True
+        n = _FETCHES[self.source_id] = _FETCHES.get(self.source_id, 0) + 1
+        cached = _DP_CACHE.get(self.source_id)
+
+        def get_dp() -> None:
+            nonlocal dp, asin
+            state["tried"] = True
+            try:
+                dp, asin = self._fetch_dp(asin)
+                state["ok"] = True
+                if dp is not None:
+                    _DP_CACHE[self.source_id] = dp
+            except Exception as e:  # captcha, HTTP error, no title: Amazon resisting
+                errors.append(f"dp: {e}")
+                self.block_level = "hard"
+
+        dp_due = (not asin                                  # the dp finds the ASIN
+                  or not _has_amazon_cookies(self.session)  # warm the session first
+                  or (n - 1) % self.dp_every == 0
+                  or (cached is not None and cached.coupon > 0))
+        if dp_due:
+            get_dp()
 
         if asin:
-            self._pause()
-            try:
-                aod = self._fetch_aod(asin)
-            except Exception as e:
-                errors.append(f"aod: {e}")
+            self.aod_tried = 1
+            aod, err = self._fetch_aod_retrying(asin)
+            if aod is not None:
+                self.aod_ok = 1
+            else:
+                errors.append(f"aod: {err}")
+                if not state["tried"]:
+                    get_dp()                       # fall back to the buybox
                 # An AOD without offers next to a dp that parsed fine is an
                 # empty listing (sold out), not pushback.
-                if not (dp_ok and _NO_OFFERS in str(e)):
-                    self.blocked = True
+                if not (state["ok"] and _NO_OFFERS in err) and self.block_level is None:
+                    self.block_level = "soft" if state["ok"] else "hard"
         else:
             errors.append("aod: no ASIN configured")
 
-        if len(errors) == 2:  # neither the dp nor the AOD gave us anything
+        if aod is None and not state["ok"]:  # neither the dp nor the AOD gave us anything
             raise RuntimeError("amazon: " + "; ".join(errors))
         if aod is not None and aod.offers and not any(self._matches(o) for o in aod.offers):
             aod.complete = False  # a panel for some other product never counts
@@ -575,18 +679,39 @@ class AmazonSeminovosSource(Source):
         if errors:  # degraded but usable — leave a trace in the run log
             print(f"[amazon] partial fetch: {'; '.join(errors)}", file=sys.stderr)
             self.degraded = errors
+        self.blocked = self.block_level is not None
         self.complete = aod is not None and aod.complete
-        return self.combine(dp, aod)
+        return self.combine(dp, aod, cached=None if state["tried"] else cached)
 
-    def combine(self, dp: Observation | None, aod: AodPage | None) -> list[Observation]:
+    def _fetch_aod_retrying(self, asin: str) -> tuple["AodPage | None", str]:
+        """The AOD, retried once after AOD_RETRY_WAIT_S when Amazon blocked it
+        (an empty listing is not retried). Returns (page or None, error)."""
+        try:
+            return self._fetch_aod(asin), ""
+        except Exception as e:
+            err = str(e)
+        if _NO_OFFERS in err:
+            return None, err
+        print(f"[amazon] {self.source_id}: {err}; retrying the AOD in "
+              f"~{AOD_RETRY_WAIT_S:.0f}s", file=sys.stderr)
+        PACER.defer(AOD_RETRY_WAIT_S)
+        try:
+            return self._fetch_aod(asin), ""
+        except Exception as e:
+            return None, f"{err}; retry: {e}"
+
+    def combine(self, dp: Observation | None, aod: AodPage | None,
+                cached: Observation | None = None) -> list[Observation]:
         """Merge the dp buybox into the AOD offers; keep target offers, one per
         listing_id: the lowest 12x total wins (``_rank``), and an installment
-        plan on the dropped copy at the same card price is kept."""
+        plan on the dropped copy at the same card price is kept. ``cached`` (a
+        previous poll's dp) only lends its plan/promos to the pinned offer at an
+        unchanged card price — it is never stored as an offer itself."""
         offers: list[Observation] = []
         if aod is not None:
             pinned = aod.pinned if aod.pinned is not None and self._matches(aod.pinned) else None
-            if pinned is not None and dp is not None:
-                self._merge_buybox(pinned, dp)
+            if pinned is not None and (dp or cached) is not None:
+                self._merge_buybox(pinned, dp or cached)
             offers.extend(aod.offers)
             if pinned is None and dp is not None:
                 offers.append(dp)  # AOD showed no (target) buybox; keep the dp one
@@ -636,18 +761,13 @@ class AmazonSeminovosSource(Source):
                     pinned.promo_ids[msg] = dp.promo_ids[msg]
         return True
 
-    def _pause(self) -> None:
-        lo, hi = self.pause_range
-        if hi > 0:
-            time.sleep(random.uniform(lo, hi))
-
     # --- product page (buybox) --------------------------------------------
 
     def _fetch_dp(self, asin: str | None) -> tuple[Observation | None, str | None]:
         """GET the product page; return (buybox observation or None, the ASIN
         whose AOD should be read)."""
         url = f"{_HOST}/dp/{asin}" if asin else self.product_url
-        r = self.session.get(url, headers=_BROWSER_HEADERS, timeout=30)
+        r = amazon_get(self.session, url, headers=_BROWSER_HEADERS, timeout=30)
         r.raise_for_status()
         obs = self.parse(url, r.content)  # raises on captcha/block
         if obs and self._matches(obs):
@@ -661,7 +781,7 @@ class AmazonSeminovosSource(Source):
                 continue
             curl = f"{_HOST}/dp/{child}"
             try:
-                cr = self.session.get(curl, headers=_BROWSER_HEADERS, timeout=30)
+                cr = amazon_get(self.session, curl, headers=_BROWSER_HEADERS, timeout=30)
                 cr.raise_for_status()
                 cobs = self.parse(curl, cr.content)
             except Exception:
@@ -881,7 +1001,7 @@ class AmazonSeminovosSource(Source):
     def _fetch_aod(self, asin: str) -> AodPage:
         """GET the AOD panel (plus extra pages only when >10 list offers)."""
         headers = _aod_headers(asin)
-        r = self.session.get(_AOD_URL.format(asin=asin), headers=headers, timeout=30)
+        r = amazon_get(self.session, _AOD_URL.format(asin=asin), headers=headers, timeout=30)
         reason = aod_block_reason(r.status_code, r.text)
         if reason:
             raise RuntimeError(f"amazon aod: {reason}")
@@ -891,10 +1011,9 @@ class AmazonSeminovosSource(Source):
         # asking past the last page repeats offers — so stop at ceil(total/10).
         n_pages = min(math.ceil((page.total or 0) / _AOD_PAGE_SIZE), _AOD_MAX_PAGES)
         for n in range(2, n_pages + 1):
-            self._pause()
             try:
-                pr = self.session.get(_AOD_PAGE_URL.format(asin=asin, n=n),
-                                      headers=headers, timeout=30)
+                pr = amazon_get(self.session, _AOD_PAGE_URL.format(asin=asin, n=n),
+                                headers=headers, timeout=30)
                 if aod_block_reason(pr.status_code, pr.text):
                     page.complete = False
                     break

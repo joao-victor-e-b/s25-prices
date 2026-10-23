@@ -46,10 +46,10 @@ from . import (
 from .cdi import get_cdi_monthly
 from .models import Observation
 from .normalize import apply_cashback, card_total, finalize, pix_price, pv
+from .sources import amazon as amazon_mod
 from .sources import is_enabled, load_source
 from .sources.amazon import is_routine_promo, parse_listing_id
 from .sources.amazon import promo_terms as amazon_promo_terms
-from .sources.base import http_session
 
 
 def load_registry(include_disabled: bool = False) -> list[dict]:
@@ -76,9 +76,11 @@ def poll(daily: bool = False, enable_new_low: bool = False,
     switch). ``cdi`` lets the loop fetch the rate once instead of every poll;
     ``iteration`` (the loop's poll number) staggers ``every: N`` sources.
 
-    Result keys: polled, failures, partial, observations, stored, alerts and
-    amazon_trouble (an Amazon source raised, or reported real pushback such as
-    a captcha or 503 — not an empty listing; the loop backs off on it).
+    Result keys: polled, failures, partial, observations, stored, alerts,
+    amazon_block ("hard": an Amazon source raised or its product page was
+    blocked; "soft": only the offers panel was blocked; None: clean or just an
+    empty listing — the loop backs off by level), amazon_trouble (= a level is
+    set), requests and aod_ok/aod_tried (logged per poll and in run_log).
     """
     if scan_coupons is None:
         scan_coupons = scan_promos
@@ -99,7 +101,9 @@ def poll(daily: bool = False, enable_new_low: bool = False,
         polled = failures = partial = stored = 0
         problems: list[str] = []   # run_log detail: failed + degraded sources
         observations: list[Observation] = []
-        amazon_trouble = False
+        block: str | None = None   # worst Amazon pushback this poll
+        aod_ok = aod_tried = 0
+        req0 = amazon_mod.PACER.count
 
         # daily runs sweep all tiers; otherwise cap at max_tier.
         allowed_max = 3 if daily else max_tier
@@ -115,13 +119,21 @@ def poll(daily: bool = False, enable_new_low: bool = False,
                 offers = src.fetch()
             except Exception as e:  # one broken site must not kill the run (spec §8)
                 failures += 1
-                amazon_trouble |= is_amazon
+                if is_amazon:
+                    block = "hard"
+                    aod_tried += getattr(src, "aod_tried", 0)
                 problems.append(f"{cfg['id']}: {e}"[:200])
                 print(f"[fetch-fail] {cfg['id']}: {e}", file=sys.stderr)
                 continue
+            if is_amazon:
+                aod_ok += getattr(src, "aod_ok", 0)
+                aod_tried += getattr(src, "aod_tried", 0)
             if getattr(src, "degraded", None):
                 partial += 1
-                amazon_trouble |= is_amazon and getattr(src, "blocked", True)
+                if is_amazon:
+                    level = getattr(src, "block_level", None) or (
+                        "hard" if getattr(src, "blocked", True) else None)
+                    block = _worse(block, level)
                 problems.append(f"{cfg['id']} partial: {'; '.join(src.degraded)}"[:200])
             for o in offers:
                 o.ts = now
@@ -152,16 +164,28 @@ def poll(daily: bool = False, enable_new_low: bool = False,
         if scan_coupons:
             coupon_errors = _scan_coupons(conn, now, dry_run, observations)
 
+        requests_made = amazon_mod.PACER.count - req0
+        stats = f"aod_ok={aod_ok}/{aod_tried} req={requests_made}"
+        print(f"[amazon] requests={requests_made} aod_ok={aod_ok}/{aod_tried}"
+              + (f" backoff={block}" if block else ""), file=sys.stderr)
         store.insert_run_log(conn, now, polled, failures, partial, coupon_errors,
-                             " | ".join(problems))
+                             " | ".join([stats] + problems))
         conn.commit()
     finally:
         conn.close()   # uncommitted work (a crash mid-poll) is rolled back
     result = {"polled": polled, "failures": failures, "partial": partial,
               "observations": len(observations), "stored": stored,
-              "alerts": len(alerts), "amazon_trouble": amazon_trouble}
+              "alerts": len(alerts), "amazon_trouble": block is not None,
+              "amazon_block": block, "requests": requests_made,
+              "aod_ok": aod_ok, "aod_tried": aod_tried}
     print(f"[poll] {result}")
     return result
+
+
+def _worse(a: str | None, b: str | None) -> str | None:
+    """The harder of two Amazon pushback levels (None < soft < hard)."""
+    order = {None: 0, "soft": 1, "hard": 2}
+    return a if order[a] >= order[b] else b
 
 
 def _recent_codes(conn, now: str, days: int = 2) -> dict[str, coupons_mod.CouponCode]:
@@ -245,14 +269,9 @@ def _promo_key(asin: str, seller_id: str, message: str) -> str:
 _ACCOUNT_FIRST_BUY_RE = re.compile(
     r"(?:primeira|1[ªa]) compra (?:na|da) amazon|primeiro pedido na amazon", re.I)
 PROMO_TERMS_CAP = 3   # terms lookups per poll (one Amazon request each)
-_TERMS_SESSION = None
-
-
 def _terms_session():
-    global _TERMS_SESSION
-    if _TERMS_SESSION is None:
-        _TERMS_SESSION = http_session()
-    return _TERMS_SESSION
+    """Terms lookups ride the shared Amazon session (and its pacer)."""
+    return amazon_mod.amazon_session()
 
 
 _PROMO_BRL_RE = re.compile(r"R\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)")
@@ -546,7 +565,9 @@ def heartbeat() -> dict:
 
 SYNC_EVERY_S = 1800        # commit + push the DB this often (and on exit)
 EXIT_SYNC_BUDGET_S = 180   # the budget exit syncs normally (retries) within this
-MAX_BACKOFF_S = 1200       # Amazon pushing back doubles the sleep up to 20 min
+MAX_BACKOFF_S = 1200       # hard pushback (dp blocked) doubles the sleep up to 20 min
+SOFT_BACKOFF = 1.5         # soft pushback (only the AOD blocked): x1.5 ...
+SOFT_BACKOFF_S = 720       # ... up to 12 min
 JITTER = (0.8, 1.2)        # ±20% so polls don't land on a fixed beat
 MAX_ERRORS_IN_A_ROW = 5    # a poll that keeps crashing ends the run (visible in CI)
 
@@ -592,9 +613,10 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
     """Poll repeatedly until ``minutes`` would be exceeded.
 
     - sleep ``interval`` seconds ±20% between polls; when Amazon pushed back
-      (a source raised, or reported a captcha/503 — not an empty listing)
-      double it, up to MAX_BACKOFF_S, and go back to ``interval`` after a
-      clean poll;
+      grow it — hard (a source raised, product page blocked/captcha): x2 up to
+      MAX_BACKOFF_S; soft (only the offers panel blocked): x1.5 up to
+      SOFT_BACKOFF_S — and go back to ``interval`` after a clean poll (an
+      empty listing is not pushback);
     - the coupon/cashback sweep runs on the first poll and then at most every
       ``coupon_every`` seconds; the DuckDuckGo deal scan stays off;
     - CDI is fetched once for the whole loop; each poll gets its iteration
@@ -632,11 +654,12 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
                 result = poll_fn(dry_run=dry_run, enable_new_low=enable_new_low,
                                  scan_promos=False, scan_coupons=do_coupons, cdi=cdi,
                                  iteration=polls)
-                trouble = bool(result.get("amazon_trouble"))
+                level = result.get("amazon_block") or (
+                    "hard" if result.get("amazon_trouble") else None)
                 errors_in_row = 0
             except Exception:
                 traceback.print_exc()
-                trouble = True
+                level = "hard"
                 errors_in_row += 1
                 if errors_in_row >= MAX_ERRORS_IN_A_ROW:
                     raise
@@ -645,7 +668,14 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
                 last_coupons = t0
             took = clock() - t0
 
-            base = min(base * 2, cap) if trouble else interval
+            trouble = level is not None
+            soft_cap = max(SOFT_BACKOFF_S, interval)
+            if level == "hard":
+                base = min(base * 2, cap)
+            elif level == "soft":
+                base = min(base * SOFT_BACKOFF, soft_cap)
+            else:
+                base = interval
             if git_sync and clock() - last_sync >= SYNC_EVERY_S:
                 try:
                     sync_fn()
@@ -656,13 +686,13 @@ def loop(minutes: float = 345, interval: float = 240, coupon_every: float = 1800
 
             wait = base * uniform(*JITTER)
             if trouble:
-                wait = min(wait, cap)
+                wait = min(wait, cap if level == "hard" else soft_cap)
             if clock() + wait + took > deadline:
                 print(f"[loop] {polls} poll(s); time budget reached, stopping")
                 budget_exit = True
                 break
             print(f"[loop] poll {polls} took {took:.0f}s; next in {wait:.0f}s"
-                  + (" (backing off)" if trouble else ""))
+                  + (f" (backing off: {level})" if trouble else ""))
             sleep(wait)
     finally:
         if git_sync:

@@ -408,3 +408,40 @@ def test_one_alert_per_message_across_sellers(env):
     assert len(env.rows("SELECT * FROM alerts_sent WHERE trigger='offer_promo'")) == 3
     env.poll()
     assert len(env.promo_blocks) == 1                           # all three recorded
+
+
+# --- CI rate limiting: per-poll request stats and pushback levels ---------------
+
+def test_poll_logs_requests_and_aod_ratio(env, capsys):
+    from src.sources import amazon as amazon_mod
+
+    class Counting(FakeSource):
+        def fetch(self):
+            amazon_mod.PACER.wait()
+            amazon_mod.PACER.wait()
+            self.aod_tried, self.aod_ok = 1, 0
+            self.block_level = "soft"
+            self.degraded = ["aod: amazon aod: HTTP 503"]
+            return super().fetch()
+
+    env.source = Counting([_offer()])
+    r = env.poll()
+    assert (r["requests"], r["aod_ok"], r["aod_tried"]) == (2, 0, 1)
+    assert r["amazon_block"] == "soft" and r["amazon_trouble"] is True
+    assert "[amazon] requests=2 aod_ok=0/1 backoff=soft" in capsys.readouterr().err
+    (row,) = env.rows("SELECT detail FROM run_log")
+    assert row["detail"].startswith("aod_ok=0/1 req=2 | amazon_seminovos partial:")
+
+
+def test_a_raising_amazon_source_is_hard_trouble(env):
+    env.source = FakeSource(error=RuntimeError("captcha"))
+    r = env.poll()
+    assert r["amazon_block"] == "hard"
+    (row,) = env.rows("SELECT detail FROM run_log")
+    assert row["detail"].startswith("aod_ok=0/0 req=0")
+
+
+def test_new_unit_listings_poll_every_third_iteration():
+    every = {c["id"]: c.get("every", 1) for c in run.load_registry()}
+    assert every["amazon_seminovos"] == every["amazon_seminovos_512"] == 1
+    assert {every[k] for k in every if k.startswith("amazon_novo")} == {3}

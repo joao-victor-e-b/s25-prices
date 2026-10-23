@@ -253,3 +253,17 @@ def test_heartbeat_exit_code(monkeypatch):   # Y1
     monkeypatch.setattr(run, "heartbeat",
                         lambda: {"wa_ok": False, "ntfy_ok": True, "message": "x"})
     assert run.main(["--heartbeat"]) == 0
+
+
+# --- CI rate limiting: soft vs hard backoff --------------------------------------
+
+def test_soft_trouble_backs_off_gently_and_hard_trouble_doubles():
+    clock = Clock()
+    soft, hard, clean = ({"amazon_block": "soft"}, {"amazon_block": "hard"},
+                         {"amazon_block": None})
+    poll_fn, _ = _poller(clock, results=[soft] * 5 + [clean, hard, hard, hard, hard, clean])
+    _loop(clock, poll_fn, minutes=600)
+    assert clock.sleeps[:11] == [360, 540, 720, 720, 720,     # x1.5 up to 12 min
+                                 240,                          # clean: reset
+                                 480, 960, 1200, 1200,         # x2 up to 20 min
+                                 240]

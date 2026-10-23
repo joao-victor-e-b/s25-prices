@@ -170,10 +170,23 @@ python -m src.run --loop --minutes 345 --interval 240 --coupon-every 1800 --git-
 ```
 
 - polls every **~4 min** (240 s ± 20% jitter) for 5h45, stopping before the
-  budget runs out; `every: N` sources only on every Nth poll;
-- when Amazon pushes back (captcha, HTTP 503/429, an error page, a source that
-  raised) the sleep doubles, up to 20 min, and resets after a clean poll — an
-  empty (sold-out) listing is not pushback;
+  budget runs out; `every: N` sources only on every Nth poll (the four
+  new-unit ASINs: every 3rd);
+- Amazon rate-limits bursts from CI IPs (the offers panel got HTTP 503 at
+  6 ASINs × 2 requests a minute), so every Amazon request in the process —
+  all sources and promotion-terms lookups — goes through one pacer
+  (`amazon.AMAZON_MIN_GAP_S` = 10 s ± 30% apart) on one shared session. Per
+  ASIN the offers panel comes first (its add-to-cart labels carry the card
+  prices the 12x total needs); the product page only on a cold session,
+  every `dp_every` (4th) poll of the source, every poll while it shows a
+  coupon, or as the fallback when the panel fails — in between, its last
+  installment plan/promos are reused at an unchanged buybox price. A blocked
+  panel is retried once after ~45 s before falling back to the product page;
+- backoff: hard pushback (a source raised, product page blocked/captcha)
+  doubles the sleep up to 20 min; soft (only the offers panel blocked) grows
+  it ×1.5 up to 12 min; a clean poll resets it — an empty (sold-out) listing
+  is not pushback. Each poll logs `[amazon] requests=N aod_ok=x/y` and
+  starts its `run_log.detail` with `aod_ok=x/y req=N`;
 - the coupon/cashback sweep runs on the first poll and then every 30 min; the
   DuckDuckGo deal scan is off in loop mode; CDI is fetched once per loop;
 - `--git-sync` pulls before the first poll (a queued run's checkout predates
